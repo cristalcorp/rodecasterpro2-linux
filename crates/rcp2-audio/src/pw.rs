@@ -159,15 +159,10 @@ fn refuse_symlink(path: &Path) -> Result<(), PwError> {
     }
 }
 
-/// Writes `contents` to `path` and flushes it to disk. With `create_new`, fails
-/// if `path` already exists; otherwise creates or truncates it.
-fn write_synced(path: &Path, contents: &[u8], create_new: bool) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(!create_new)
-        .create_new(create_new)
-        .truncate(!create_new)
-        .open(path)?;
+/// Writes `contents` to a new file at `path` and flushes it to disk. Fails if
+/// anything, including a symlink, already exists at `path`: nothing is followed.
+fn write_synced(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(contents)?;
     file.sync_all()
 }
@@ -187,7 +182,7 @@ fn write_backup(path: &Path, previous: &[u8]) -> Result<PathBuf, PwError> {
             name.push(format!(".bak-{stamp}-{n}"));
         }
         let backup = PathBuf::from(name);
-        match write_synced(&backup, previous, true) {
+        match write_synced(&backup, previous) {
             Ok(()) => return Ok(backup),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => last = Some((backup, err)),
             Err(err) => {
@@ -239,13 +234,23 @@ pub fn install_config(path: &Path, contents: &str) -> Result<InstallOutcome, PwE
         None => InstallOutcome::Created,
     };
 
+    // A leftover temp file (or a symlink planted there) is removed, never
+    // followed: remove_file deletes the link itself.
     let tmp = path.with_extension("conf.tmp");
-    let written = write_synced(&tmp, contents.as_bytes(), false)
+    match fs::remove_file(&tmp) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(io_err(&tmp)(err)),
+        _ => {}
+    }
+    let written = write_synced(&tmp, contents.as_bytes())
         .map_err(io_err(&tmp))
         .and_then(|()| fs::rename(&tmp, path).map_err(io_err(path)));
     if written.is_err() {
-        // Best effort: the error being returned matters more than a stray temp file.
+        // Best effort cleanup: the error being returned matters more. The config
+        // itself is unchanged, so a backup of it would only be clutter.
         let _ = fs::remove_file(&tmp);
+        if let InstallOutcome::Replaced { backup } = &outcome {
+            let _ = fs::remove_file(backup);
+        }
     }
     written.map(|()| outcome)
 }
@@ -350,6 +355,31 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&real).unwrap(), "old");
         assert_eq!(fs::read_dir(link.parent().unwrap()).unwrap().count(), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn never_follows_a_symlink_planted_at_the_temp_path() {
+        let dir = scratch_dir("tmp-symlink");
+        let victim = dir.join("victim.conf");
+        let path = dir.join("50-test.conf");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&victim, "precious").unwrap();
+        std::os::unix::fs::symlink(&victim, path.with_extension("conf.tmp")).unwrap();
+
+        assert_eq!(
+            install_config(&path, "new").unwrap(),
+            InstallOutcome::Created
+        );
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
         fs::remove_dir_all(&dir).unwrap();
     }
 }

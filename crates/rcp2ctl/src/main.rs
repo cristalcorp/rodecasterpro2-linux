@@ -161,7 +161,7 @@ fn apps(graph: &Graph, out: &mut impl Write) -> Result<(), CliError> {
     }
     writeln!(
         out,
-        "{:>6}  {:<16}  {:<24}  {:<12}  MEDIA",
+        "{:>6}  {:<16}  {:<24}  {:<24}  MEDIA",
         "ID", "BINARY", "APPLICATION", "OUTPUT"
     )?;
     for stream in &streams {
@@ -177,7 +177,7 @@ fn apps(graph: &Graph, out: &mut impl Write) -> Result<(), CliError> {
         };
         writeln!(
             out,
-            "{:>6}  {:<16}  {:<24}  {:<12}  {}",
+            "{:>6}  {:<16}  {:<24}  {:<24}  {}",
             stream.node.id,
             stream.node.process_binary.as_deref().unwrap_or("-"),
             stream.app_label(),
@@ -185,10 +185,6 @@ fn apps(graph: &Graph, out: &mut impl Write) -> Result<(), CliError> {
             stream.node.media_name.as_deref().unwrap_or("")
         )?;
     }
-    writeln!(
-        out,
-        "Route by ID, binary or application name; an ID picks a single stream."
-    )?;
     Ok(())
 }
 
@@ -210,19 +206,31 @@ fn route(
     if streams.is_empty() {
         return Err(CliError::NoSuchApp(selector.to_owned()));
     }
-    // Move every stream before printing: a closed stdout must not leave the
-    // routing half done.
+    // Move every stream before printing, so a closed stdout cannot leave the
+    // routing half done; if a move fails, still report the ones already done.
+    let mut moved = Vec::with_capacity(streams.len());
+    let mut failure = None;
     for stream in &streams {
-        move_stream(stream.node.id, serial)?;
+        match move_stream(stream.node.id, serial) {
+            Ok(()) => moved.push(stream),
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
     }
-    for stream in &streams {
+    for stream in moved {
         writeln!(
             out,
-            "{} (stream {}) -> {}",
+            "{} [{}] (stream {}) -> {}",
             stream.app_label(),
+            stream.node.process_binary.as_deref().unwrap_or("-"),
             stream.node.id,
             channel.description()
         )?;
+    }
+    if let Some(err) = failure {
+        return Err(err.into());
     }
     Ok(())
 }
