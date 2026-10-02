@@ -5,4 +5,4 @@ allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 
 # Product names, not code identifiers ("..": keep clippy defaults).
-doc-valid-idents = ["RØDECaster", "PipeWire", "WirePlumber", ".."]
+doc-valid-idents = ["RØDECaster", "PipeWire", "WirePlumber", "PulseAudio", ".."]

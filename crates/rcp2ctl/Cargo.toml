@@ -11,7 +11,9 @@ publish.workspace = true
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 rcp2-audio = { path = "../rcp2-audio" }
+serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
+toml = "1.1.6"
 
 [lints]
 workspace = true
