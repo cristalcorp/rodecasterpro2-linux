@@ -31,9 +31,9 @@ enum Command {
     Apps,
     /// Send an application to a named output (remembered for its next runs).
     Route {
-        /// Stream ID, application name or process binary (see `rcp2ctl apps`).
+        /// Stream ID, process binary or application name, as listed by `rcp2ctl apps`.
         app: String,
-        /// Output: chat, usb1, game, music, a or b.
+        /// Named output (an invalid value lists the valid ones).
         channel: Channel,
     },
 }
@@ -54,7 +54,7 @@ enum CliError {
     OutputMissing(&'static str),
     #[error("the \"{0}\" output has no object.serial; cannot route to it")]
     NoSerial(&'static str),
-    #[error("cannot write to the terminal: {0}")]
+    #[error("cannot write output: {0}")]
     Output(#[from] io::Error),
 }
 
@@ -63,6 +63,8 @@ fn main() -> ExitCode {
     let mut out = io::stdout().lock();
     match run(cli.command, &mut out) {
         Ok(()) => ExitCode::SUCCESS,
+        // The reader went away (e.g. `rcp2ctl apps | head -1`): not an error.
+        Err(CliError::Output(err)) if err.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(err) => {
             // Nothing sensible is left to do if stderr itself is unwritable.
             let _ = writeln!(io::stderr().lock(), "rcp2ctl: {err}");
@@ -138,24 +140,12 @@ fn config(graph: &Graph, install: bool, out: &mut impl Write) -> Result<(), CliE
     Ok(())
 }
 
-/// Name to show for a node an application plays to: our channel label for our
-/// own outputs, the description otherwise.
-fn target_label(graph: &Graph, node: &rcp2_audio::Node) -> String {
-    Channel::ALL
-        .into_iter()
-        .find(|channel| {
-            graph
-                .virtual_sink(*channel)
-                .is_some_and(|sink| sink.id == node.id)
-        })
-        .map_or_else(
-            || {
-                node.description
-                    .clone()
-                    .unwrap_or_else(|| node.name.clone())
-            },
-            Channel::description,
-        )
+/// Name to show for a node an application plays to (our outputs carry their
+/// `RØDE <channel>` label in `node.description`).
+fn target_label(node: &rcp2_audio::Node) -> String {
+    node.description
+        .clone()
+        .unwrap_or_else(|| node.name.clone())
 }
 
 fn apps(graph: &Graph, out: &mut impl Write) -> Result<(), CliError> {
@@ -176,7 +166,7 @@ fn apps(graph: &Graph, out: &mut impl Write) -> Result<(), CliError> {
             stream
                 .targets
                 .iter()
-                .map(|node| target_label(graph, node))
+                .map(|node| target_label(node))
                 .collect::<Vec<_>>()
                 .join(", ")
         };

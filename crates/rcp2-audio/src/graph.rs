@@ -1,5 +1,7 @@
 //! Read-only model of the PipeWire graph, parsed from `pw-dump` JSON output.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -66,21 +68,23 @@ pub struct Node {
     pub profile_name: Option<String>,
     /// `audio.channels`.
     pub channels: Option<u64>,
-    /// `application.name`.
+    /// `application.name`, from the node or else from its client.
     pub app_name: Option<String>,
-    /// `application.process.binary`.
+    /// `application.process.binary`, from the node or else from its client
+    /// (streams going through PipeWire's ALSA plugin only carry it there).
     pub process_binary: Option<String>,
     /// `media.name`, e.g. the page or track being played.
     pub media_name: Option<String>,
+    /// Whether the node belongs to a `node.link-group`: one half of a loopback,
+    /// filter chain or echo canceller, never an application.
+    pub internal: bool,
 }
 
 /// A link between two nodes (data flows from `output_node` to `input_node`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Link {
-    /// Node producing audio.
-    pub output_node: u32,
-    /// Node consuming audio.
-    pub input_node: u32,
+struct Link {
+    output_node: u32,
+    input_node: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,13 +124,15 @@ pub struct AppStream<'a> {
 }
 
 impl AppStream<'_> {
-    /// Best human-readable name for the application.
+    /// Name to show for the application. The process binary comes first because
+    /// it is what [`AppStream::matches`] accepts and what users type; the
+    /// application name can be generic (e.g. `PipeWire ALSA [qbz]`).
     #[must_use]
     pub fn app_label(&self) -> &str {
         self.node
-            .app_name
+            .process_binary
             .as_deref()
-            .or(self.node.process_binary.as_deref())
+            .or(self.node.app_name.as_deref())
             .unwrap_or(&self.node.name)
     }
 
@@ -200,6 +206,8 @@ impl Graph {
     pub fn from_pw_dump(json: &str) -> Result<Self, ParseError> {
         let objects: Vec<RawObject> = serde_json::from_str(json)?;
         let mut graph = Self::default();
+        let mut clients: HashMap<u64, Map<String, Value>> = HashMap::new();
+        let mut node_clients: Vec<Option<u64>> = Vec::new();
         for object in objects {
             let Some(info) = object.info else { continue };
             match object.kind.as_str() {
@@ -208,6 +216,7 @@ impl Graph {
                     let Some(name) = prop_str(&props, "node.name") else {
                         continue;
                     };
+                    node_clients.push(prop_u64(&props, "client.id"));
                     graph.nodes.push(Node {
                         id: object.id,
                         serial: prop_u64(&props, "object.serial"),
@@ -220,6 +229,7 @@ impl Graph {
                         app_name: prop_str(&props, "application.name"),
                         process_binary: prop_str(&props, "application.process.binary"),
                         media_name: prop_str(&props, "media.name"),
+                        internal: props.contains_key("node.link-group"),
                     });
                 }
                 "PipeWire:Interface:Device" => {
@@ -229,6 +239,11 @@ impl Graph {
                         vendor_id: prop_str(&props, "device.vendor.id"),
                         product_name: prop_str(&props, "device.product.name"),
                     });
+                }
+                "PipeWire:Interface:Client" => {
+                    if let Some(props) = info.props {
+                        clients.insert(u64::from(object.id), props);
+                    }
                 }
                 "PipeWire:Interface:Link" => {
                     if let (Some(output_node), Some(input_node)) =
@@ -241,6 +256,18 @@ impl Graph {
                     }
                 }
                 _ => {}
+            }
+        }
+        // Clients may appear before or after their nodes: resolve once all are read.
+        for (node, client_id) in graph.nodes.iter_mut().zip(node_clients) {
+            let Some(client) = client_id.and_then(|id| clients.get(&id)) else {
+                continue;
+            };
+            if node.app_name.is_none() {
+                node.app_name = prop_str(client, "application.name");
+            }
+            if node.process_binary.is_none() {
+                node.process_binary = prop_str(client, "application.process.binary");
             }
         }
         Ok(graph)
@@ -307,19 +334,21 @@ impl Graph {
     /// The named virtual sink for `channel`, if it exists.
     #[must_use]
     pub fn virtual_sink(&self, channel: Channel) -> Option<&Node> {
-        let name = channel.sink_name();
-        self.nodes
-            .iter()
-            .find(|node| node.name == name && node.media_class.as_deref() == Some("Audio/Sink"))
+        self.nodes.iter().find(|node| {
+            node.name.strip_prefix(OWN_NODE_PREFIX) == Some(channel.id())
+                && node.media_class.as_deref() == Some("Audio/Sink")
+        })
     }
 
-    /// Application playback streams, excluding the ones this project creates.
+    /// Application playback streams: excludes the internal streams of
+    /// loopbacks and filters (ours included), which must not be rerouted.
     #[must_use]
     pub fn app_streams(&self) -> Vec<AppStream<'_>> {
         self.nodes
             .iter()
             .filter(|node| {
                 node.media_class.as_deref() == Some("Stream/Output/Audio")
+                    && !node.internal
                     && !node.name.starts_with(OWN_NODE_PREFIX)
             })
             .map(|node| AppStream {
@@ -331,13 +360,15 @@ impl Graph {
 
     /// Nodes `node_id` sends audio to, deduplicated, in graph order.
     fn targets_of(&self, node_id: u32) -> Vec<&Node> {
+        let inputs: HashSet<u32> = self
+            .links
+            .iter()
+            .filter(|link| link.output_node == node_id)
+            .map(|link| link.input_node)
+            .collect();
         self.nodes
             .iter()
-            .filter(|candidate| {
-                self.links
-                    .iter()
-                    .any(|link| link.output_node == node_id && link.input_node == candidate.id)
-            })
+            .filter(|candidate| inputs.contains(&candidate.id))
             .collect()
     }
 }

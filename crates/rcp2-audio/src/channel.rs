@@ -131,9 +131,23 @@ impl fmt::Display for Channel {
 }
 
 /// Error returned when parsing an unknown channel name.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown channel `{0}` (expected one of: chat, usb1, game, music, a, b)")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownChannel(pub String);
+
+impl fmt::Display for UnknownChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown channel `{}` (expected one of: ", self.0)?;
+        for (i, channel) in Channel::ALL.into_iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(channel.id())?;
+        }
+        f.write_str(")")
+    }
+}
+
+impl std::error::Error for UnknownChannel {}
 
 impl FromStr for Channel {
     type Err = UnknownChannel;
@@ -156,6 +170,14 @@ mod tests {
         assert_eq!("Music".parse::<Channel>().unwrap(), Channel::Music);
         assert_eq!("USB1".parse::<Channel>().unwrap(), Channel::Usb1);
         assert!("fader5".parse::<Channel>().is_err());
+    }
+
+    #[test]
+    fn unknown_channel_lists_every_valid_id() {
+        let message = "fader5".parse::<Channel>().unwrap_err().to_string();
+        for channel in Channel::ALL {
+            assert!(message.contains(channel.id()), "{message}");
+        }
     }
 
     #[test]

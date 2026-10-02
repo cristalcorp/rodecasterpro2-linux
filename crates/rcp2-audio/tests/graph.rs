@@ -77,8 +77,9 @@ fn lists_app_streams_without_our_own_loopbacks() {
         .iter()
         .map(|s| s.app_label().to_owned())
         .collect();
-    // The node without a name is skipped; rcp2.game.output is ours.
-    assert_eq!(labels, ["Firefox", "spotify"]);
+    // Skipped: the node without a name, our rcp2.game.output loopback, and the
+    // filter chain's internal stream (it has a node.link-group).
+    assert_eq!(labels, ["firefox", "spotify", "qbz"]);
 }
 
 #[test]
@@ -96,7 +97,7 @@ fn reports_where_each_app_plays_once_per_target() {
             .collect()
     };
     // Two links (one per channel) to the same sink count once.
-    assert_eq!(targets("Firefox"), [STEREO]);
+    assert_eq!(targets("firefox"), [STEREO]);
     assert_eq!(targets("spotify"), ["rcp2.game"]);
 }
 
@@ -121,6 +122,12 @@ fn selects_streams_by_id_app_or_binary_ignoring_case() {
     assert_eq!(selected("300"), [300]);
     assert_eq!(selected("FIREFOX"), [300]);
     assert_eq!(selected("spotify"), [301]);
+    // Binary known only through the stream's client (PipeWire ALSA plugin).
+    assert_eq!(selected("qbz"), [303]);
+    assert!(
+        selected("effect_output.eq").is_empty(),
+        "internal streams are not routable"
+    );
     assert!(selected("fire").is_empty(), "no substring matching");
 }
 

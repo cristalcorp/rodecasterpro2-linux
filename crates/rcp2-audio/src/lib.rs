@@ -21,5 +21,5 @@ mod pw;
 
 pub use channel::{Channel, NativeSink, UnknownChannel};
 pub use config::{CONFIG_FILE_NAME, UnsafeNodeName, pipewire_config};
-pub use graph::{AppStream, DetectError, Graph, Link, Node, ParseError, Rode};
+pub use graph::{AppStream, DetectError, Graph, Node, ParseError, Rode};
 pub use pw::{InstallOutcome, PwError, config_path, install_config, move_stream, snapshot};

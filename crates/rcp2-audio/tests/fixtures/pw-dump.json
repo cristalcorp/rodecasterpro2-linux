@@ -150,6 +150,43 @@
     }
   },
   {
+    "id": 303,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 417,
+        "node.name": "alsa_playback.qbz",
+        "media.class": "Stream/Output/Audio",
+        "application.name": "PipeWire ALSA [qbz]",
+        "client.id": 180,
+        "media.name": "ALSA Playback"
+      }
+    }
+  },
+  {
+    "id": 304,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 418,
+        "node.name": "effect_output.eq",
+        "media.class": "Stream/Output/Audio",
+        "node.link-group": "filter-chain-1234-15",
+        "node.virtual": true
+      }
+    }
+  },
+  {
+    "id": 180,
+    "type": "PipeWire:Interface:Client",
+    "info": {
+      "props": {
+        "application.name": "PipeWire ALSA [qbz]",
+        "application.process.binary": "qbz"
+      }
+    }
+  },
+  {
     "id": 500,
     "type": "PipeWire:Interface:Link",
     "info": { "output-node-id": 300, "input-node-id": 88 }
