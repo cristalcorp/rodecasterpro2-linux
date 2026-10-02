@@ -141,8 +141,8 @@ pub enum InstallOutcome {
     },
 }
 
-/// How many same-second backups are tried before giving up.
-const MAX_BACKUPS_PER_SECOND: u32 = 100;
+/// How many same-second names are tried before giving up.
+const MAX_NAMES_PER_SECOND: u32 = 100;
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> PwError + use<> {
     let path = path.to_owned();
@@ -167,33 +167,34 @@ fn write_synced(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Copies `previous` to a new `<path>.bak-<unix seconds>[-<n>]` file, never
-/// overwriting an existing backup.
-fn write_backup(path: &Path, previous: &[u8]) -> Result<PathBuf, PwError> {
+/// Writes `contents` to a new, never pre-existing file named
+/// `<path>.<tag>-<unix seconds>[-<n>]` and returns its path. The name does not
+/// end in `.conf`, so PipeWire ignores it; concurrent callers never share one.
+fn write_unique(path: &Path, tag: &str, contents: &[u8]) -> Result<PathBuf, PwError> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
     let mut last = None;
-    for n in 0..MAX_BACKUPS_PER_SECOND {
+    for n in 0..MAX_NAMES_PER_SECOND {
         let mut name = path.as_os_str().to_owned();
         if n == 0 {
-            name.push(format!(".bak-{stamp}"));
+            name.push(format!(".{tag}-{stamp}"));
         } else {
-            name.push(format!(".bak-{stamp}-{n}"));
+            name.push(format!(".{tag}-{stamp}-{n}"));
         }
-        let backup = PathBuf::from(name);
-        match write_synced(&backup, previous) {
-            Ok(()) => return Ok(backup),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => last = Some((backup, err)),
+        let candidate = PathBuf::from(name);
+        match write_synced(&candidate, contents) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => last = Some((candidate, err)),
             Err(err) => {
-                // A partial backup would look valid: remove it (best effort).
-                let _ = fs::remove_file(&backup);
-                return Err(io_err(&backup)(err));
+                // A partial file would look valid: remove it (best effort).
+                let _ = fs::remove_file(&candidate);
+                return Err(io_err(&candidate)(err));
             }
         }
     }
     Err(match last {
-        Some((backup, err)) => io_err(&backup)(err),
+        Some((candidate, err)) => io_err(&candidate)(err),
         None => io_err(path)(io::Error::from(io::ErrorKind::AlreadyExists)),
     })
 }
@@ -202,9 +203,9 @@ fn write_backup(path: &Path, previous: &[u8]) -> Result<PathBuf, PwError> {
 /// `<path>.bak-<unix seconds>` (PipeWire only loads `*.conf`, so the backup is
 /// inert).
 ///
-/// The previous content is backed up first, then the new file replaces it in a
-/// single atomic rename of a file already flushed to disk: at no point is the
-/// file missing or partial.
+/// The new content is first written and flushed to a uniquely named temporary
+/// file, the previous content is backed up, then a single atomic rename puts
+/// the new file in place: at no point is the config missing or partial.
 ///
 /// Does not restart PipeWire: the caller tells the user how to apply it.
 ///
@@ -212,7 +213,8 @@ fn write_backup(path: &Path, previous: &[u8]) -> Result<PathBuf, PwError> {
 ///
 /// Returns [`PwError::Symlink`] if `path` is a symlink, and [`PwError::Io`] if
 /// a directory or file cannot be read, created, renamed or written. On error
-/// the existing file is left untouched.
+/// the existing file is left untouched and no temporary file or backup is left
+/// behind (best effort).
 pub fn install_config(path: &Path, contents: &str) -> Result<InstallOutcome, PwError> {
     refuse_symlink(path)?;
     let previous = match fs::read(path) {
@@ -227,32 +229,30 @@ pub fn install_config(path: &Path, contents: &str) -> Result<InstallOutcome, PwE
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(io_err(dir))?;
     }
-    let outcome = match previous {
-        Some(previous) => InstallOutcome::Replaced {
-            backup: write_backup(path, &previous)?,
-        },
-        None => InstallOutcome::Created,
+    let tmp = write_unique(path, "tmp", contents.as_bytes())?;
+    let outcome = match previous.map(|previous| write_backup_then_rename(path, &tmp, &previous)) {
+        Some(Ok(backup)) => Ok(InstallOutcome::Replaced { backup }),
+        Some(Err(err)) => Err(err),
+        None => fs::rename(&tmp, path)
+            .map(|()| InstallOutcome::Created)
+            .map_err(io_err(path)),
     };
-
-    // A leftover temp file (or a symlink planted there) is removed, never
-    // followed: remove_file deletes the link itself.
-    let tmp = path.with_extension("conf.tmp");
-    match fs::remove_file(&tmp) {
-        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(io_err(&tmp)(err)),
-        _ => {}
-    }
-    let written = write_synced(&tmp, contents.as_bytes())
-        .map_err(io_err(&tmp))
-        .and_then(|()| fs::rename(&tmp, path).map_err(io_err(path)));
-    if written.is_err() {
-        // Best effort cleanup: the error being returned matters more. The config
-        // itself is unchanged, so a backup of it would only be clutter.
+    if outcome.is_err() {
+        // Best effort cleanup: the error being returned matters more.
         let _ = fs::remove_file(&tmp);
-        if let InstallOutcome::Replaced { backup } = &outcome {
-            let _ = fs::remove_file(backup);
-        }
     }
-    written.map(|()| outcome)
+    outcome
+}
+
+/// Backs up `previous`, then renames `tmp` over `path`. If the rename fails,
+/// the backup of the still-unchanged config is removed.
+fn write_backup_then_rename(path: &Path, tmp: &Path, previous: &[u8]) -> Result<PathBuf, PwError> {
+    let backup = write_unique(path, "bak", previous)?;
+    if let Err(err) = fs::rename(tmp, path) {
+        let _ = fs::remove_file(&backup);
+        return Err(io_err(path)(err));
+    }
+    Ok(backup)
 }
 
 #[cfg(test)]
@@ -287,7 +287,8 @@ mod tests {
         };
         assert_eq!(fs::read_to_string(&path).unwrap(), "two");
         assert_eq!(fs::read_to_string(&backup).unwrap(), "one");
-        assert!(!path.with_extension("conf.tmp").exists());
+        // Only the config and its backup remain: no temporary file.
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 2);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -355,31 +356,6 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&real).unwrap(), "old");
         assert_eq!(fs::read_dir(link.parent().unwrap()).unwrap().count(), 2);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn never_follows_a_symlink_planted_at_the_temp_path() {
-        let dir = scratch_dir("tmp-symlink");
-        let victim = dir.join("victim.conf");
-        let path = dir.join("50-test.conf");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(&victim, "precious").unwrap();
-        std::os::unix::fs::symlink(&victim, path.with_extension("conf.tmp")).unwrap();
-
-        assert_eq!(
-            install_config(&path, "new").unwrap(),
-            InstallOutcome::Created
-        );
-
-        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
-        assert!(
-            !fs::symlink_metadata(&path)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
         fs::remove_dir_all(&dir).unwrap();
     }
 }

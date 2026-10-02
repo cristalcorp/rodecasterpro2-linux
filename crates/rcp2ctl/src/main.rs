@@ -28,6 +28,9 @@ enum Command {
         install: bool,
     },
     /// List applications playing audio and where they play.
+    ///
+    /// Several applications can share a binary (Wine, Electron): route a single
+    /// stream by its ID.
     Apps,
     /// Send an application to a named output (remembered for its next runs).
     Route {
@@ -48,6 +51,13 @@ enum CliError {
     UnsafeNodeName(#[from] UnsafeNodeName),
     #[error("no application matches `{0}` (see `rcp2ctl apps`)")]
     NoSuchApp(String),
+    #[error("could not move stream(s) {}: {first}", join_ids(.failed))]
+    RouteFailed {
+        /// IDs of the streams that were not moved.
+        failed: Vec<u32>,
+        /// Error of the first failed move.
+        first: PwError,
+    },
     #[error(
         "the \"{0}\" output is not installed: run `rcp2ctl config --install`, then restart PipeWire"
     )]
@@ -206,20 +216,21 @@ fn route(
     if streams.is_empty() {
         return Err(CliError::NoSuchApp(selector.to_owned()));
     }
-    // Move every stream before printing, so a closed stdout cannot leave the
-    // routing half done; if a move fails, still report the ones already done.
+    // Try every stream before printing, so neither a failed move nor a closed
+    // stdout leaves the others unrouted.
     let mut moved = Vec::with_capacity(streams.len());
-    let mut failure = None;
+    let mut failed = Vec::new();
+    let mut first = None;
     for stream in &streams {
         match move_stream(stream.node.id, serial) {
             Ok(()) => moved.push(stream),
             Err(err) => {
-                failure = Some(err);
-                break;
+                failed.push(stream.node.id);
+                first.get_or_insert(err);
             }
         }
     }
-    for stream in moved {
+    let printed = moved.iter().try_for_each(|stream| {
         writeln!(
             out,
             "{} [{}] (stream {}) -> {}",
@@ -227,10 +238,19 @@ fn route(
             stream.node.process_binary.as_deref().unwrap_or("-"),
             stream.node.id,
             channel.description()
-        )?;
+        )
+    });
+    // A routing failure outranks an output error (which may be a benign broken pipe).
+    if let Some(first) = first {
+        return Err(CliError::RouteFailed { failed, first });
     }
-    if let Some(err) = failure {
-        return Err(err.into());
-    }
+    printed?;
     Ok(())
+}
+
+fn join_ids(ids: &[u32]) -> String {
+    ids.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
