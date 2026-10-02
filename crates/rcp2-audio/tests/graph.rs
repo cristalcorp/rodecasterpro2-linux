@@ -141,3 +141,9 @@ fn generates_the_reference_config() {
 fn rejects_input_that_is_not_a_pw_dump() {
     assert!(Graph::from_pw_dump("{\"not\": \"an array\"}").is_err());
 }
+
+#[test]
+fn reads_the_default_sink_from_metadata() {
+    assert_eq!(graph().default_sink(), Some("rcp2.game"));
+    assert_eq!(graph_without(&[30]).default_sink(), None);
+}

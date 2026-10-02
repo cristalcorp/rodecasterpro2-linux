@@ -34,12 +34,12 @@ everything else. This project aims to:
 |---|---|
 | `rcp2-proto` | Pure codec for the HID control protocol (no I/O, fuzzable) |
 | `rcp2-audio` | PipeWire side: board detection, named outputs (runtime or persistent), app routing |
-| `rcp2ctl` | Command-line tool, then TUI |
+| `rcp2ctl` | TUI (no arguments) and command-line tool |
 
 ## Status
 
-Named outputs and app routing work (PipeWire side). Nothing talks to the
-board's HID control interface yet.
+Named outputs, app routing, default output and a TUI work (PipeWire side).
+Nothing talks to the board's HID control interface yet.
 
 ## Usage
 
@@ -48,9 +48,20 @@ board in the **Pro Audio** profile (pavucontrol, *Configuration* tab).
 
 ```sh
 cargo build --release
-target/release/rcp2ctl status              # board + named outputs (creates them if missing)
-target/release/rcp2ctl apps                # who plays where
-target/release/rcp2ctl route firefox game  # remembered for the app's next runs
+target/release/rcp2ctl                     # interactive interface (TUI)
+```
+
+In the TUI: `↑`/`↓` select an application, `1`–`6` send it to an output,
+`Tab` switches to the outputs panel where `Enter` makes one the system default,
+`o` turns the named outputs on/off, `p` toggles persistence, `?` shows help.
+
+The same actions from the command line:
+
+```sh
+rcp2ctl status              # board + named outputs (creates them if missing)
+rcp2ctl apps                # who plays where
+rcp2ctl route firefox game  # remembered for the app's next runs
+rcp2ctl default usb1        # system default output (remembered by WirePlumber)
 ```
 
 ### How the named outputs are kept

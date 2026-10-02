@@ -158,6 +158,7 @@ pub struct Graph {
     nodes: Vec<Node>,
     devices: Vec<Device>,
     links: Vec<Link>,
+    default_sink: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +168,19 @@ struct RawObject {
     kind: String,
     #[serde(default)]
     info: Option<RawInfo>,
+    /// Metadata objects carry their properties and entries at the top level.
+    #[serde(default)]
+    props: Option<Map<String, Value>>,
+    #[serde(default)]
+    metadata: Option<Vec<RawMetadataEntry>>,
+}
+
+#[derive(Deserialize)]
+struct RawMetadataEntry {
+    subject: u32,
+    key: String,
+    #[serde(default)]
+    value: Value,
 }
 
 #[derive(Deserialize)]
@@ -208,6 +222,10 @@ impl Graph {
         let mut clients: HashMap<u64, (Option<String>, Option<String>)> = HashMap::new();
         let mut nodes: Vec<(Node, Option<u64>)> = Vec::new();
         for object in objects {
+            if object.kind == "PipeWire:Interface:Metadata" {
+                graph.read_default_metadata(&object);
+                continue;
+            }
             let Some(info) = object.info else { continue };
             match object.kind.as_str() {
                 "PipeWire:Interface:Node" => {
@@ -276,6 +294,32 @@ impl Graph {
             graph.nodes.push(node);
         }
         Ok(graph)
+    }
+
+    /// Reads the current default sink from the `default` metadata object.
+    fn read_default_metadata(&mut self, object: &RawObject) {
+        let is_default = object
+            .props
+            .as_ref()
+            .and_then(|props| prop_str(props, "metadata.name"))
+            .is_some_and(|name| name == "default");
+        if !is_default {
+            return;
+        }
+        let sink = object.metadata.iter().flatten().find_map(|entry| {
+            (entry.subject == 0 && entry.key == "default.audio.sink")
+                .then(|| entry.value.get("name")?.as_str().map(str::to_owned))
+                .flatten()
+        });
+        if sink.is_some() {
+            self.default_sink = sink;
+        }
+    }
+
+    /// `node.name` of the current default sink, if PipeWire reports one.
+    #[must_use]
+    pub fn default_sink(&self) -> Option<&str> {
+        self.default_sink.as_deref()
     }
 
     /// All nodes in the graph.

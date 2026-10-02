@@ -8,7 +8,20 @@
     "id": 30,
     "type": "PipeWire:Interface:Metadata",
     "props": { "metadata.name": "default" },
-    "metadata": []
+    "metadata": [
+      {
+        "subject": 0,
+        "key": "default.audio.sink",
+        "type": "Spa:String:JSON",
+        "value": { "name": "rcp2.game" }
+      },
+      {
+        "subject": 0,
+        "key": "default.audio.source",
+        "type": "Spa:String:JSON",
+        "value": { "name": "alsa_input.usb-R__DE_RODECaster_Pro_II_TESTSERIAL-00.pro-input-0" }
+      }
+    ]
   },
   {
     "id": 40,
