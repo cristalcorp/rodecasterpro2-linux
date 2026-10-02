@@ -33,7 +33,7 @@ everything else. This project aims to:
 | Crate | Role |
 |---|---|
 | `rcp2-proto` | Pure codec for the HID control protocol (no I/O, fuzzable) |
-| `rcp2-audio` | PipeWire side: board detection, named outputs, app routing |
+| `rcp2-audio` | PipeWire side: board detection, named outputs (runtime or persistent), app routing |
 | `rcp2ctl` | Command-line tool, then TUI |
 
 ## Status
@@ -43,17 +43,33 @@ board's HID control interface yet.
 
 ## Usage
 
-Requirements: PipeWire with WirePlumber, and the board in the **Pro Audio**
-profile (pavucontrol, *Configuration* tab).
+Requirements: PipeWire with WirePlumber and `pipewire-pulse` (`pactl`), and the
+board in the **Pro Audio** profile (pavucontrol, *Configuration* tab).
 
 ```sh
 cargo build --release
-target/release/rcp2ctl status              # board + named outputs
-target/release/rcp2ctl config --install    # declare the outputs (backs up any previous file)
-systemctl --user restart pipewire pipewire-pulse wireplumber
+target/release/rcp2ctl status              # board + named outputs (creates them if missing)
 target/release/rcp2ctl apps                # who plays where
 target/release/rcp2ctl route firefox game  # remembered for the app's next runs
 ```
+
+### How the named outputs are kept
+
+- **By default, no file is touched.** Every launch of `rcp2ctl` creates the
+  missing outputs at runtime inside PipeWire. They last until PipeWire restarts
+  (e.g. a reboot) and come back the next time `rcp2ctl` runs. If `rcp2ctl` is
+  never launched, the system stays exactly as it was.
+- **`rcp2ctl persist on`** keeps them across reboots without launching
+  `rcp2ctl`, through a PipeWire config file. What was at that path before is
+  recorded first; **`rcp2ctl persist off`** restores it byte for byte. No
+  PipeWire restart is needed either way.
+- **`rcp2ctl outputs off|on`** removes or brings back the runtime outputs.
+- **`rcp2ctl uninstall`** undoes everything before you remove the binary. It
+  asks whether to restore the original PipeWire configuration (default: yes).
+  Removing the binary directly cannot ask anything, so run this first.
+
+The application's own settings live in `~/.config/rodecasterpro2-linux/`, and
+the record of the original state in `~/.local/share/rodecasterpro2-linux/`.
 
 The board's USB playback channels, as verified on hardware (firmware-dependent):
 
@@ -69,8 +85,6 @@ The board's USB playback channels, as verified on hardware (firmware-dependent):
 Outputs are named after the board's channels, not its faders: any channel can be
 assigned to any fader on the board.
 
-To undo: delete `~/.config/pipewire/pipewire.conf.d/50-rodecaster-virtual-sinks.conf`
-and restart PipeWire as above.
 
 ## Prior art and credits
 
