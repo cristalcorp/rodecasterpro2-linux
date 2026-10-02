@@ -81,14 +81,15 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return Action::None;
         }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Action::Quit;
+        }
         if self.show_help {
-            // Any key closes the help.
+            // Any other key closes the help.
             self.show_help = false;
             return Action::None;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('c') if ctrl => Action::Quit,
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
             KeyCode::Char('?') => {
                 self.show_help = true;
@@ -112,7 +113,9 @@ impl App {
                 self.move_selection(true);
                 Action::None
             }
-            KeyCode::Char(digit @ '1'..='9') => self.route_to_digit(digit),
+            KeyCode::Char(digit @ '1'..='9') if self.focus == Focus::Apps => {
+                self.route_to_digit(digit)
+            }
             KeyCode::Enter | KeyCode::Char('d') if self.focus == Focus::Outputs => self
                 .selected_output()
                 .map_or(Action::None, Action::SetDefault),
@@ -204,6 +207,23 @@ mod tests {
         assert_eq!(
             press(&mut app, KeyCode::Enter),
             Action::SetDefault(Channel::Usb1)
+        );
+    }
+
+    #[test]
+    fn digits_do_nothing_in_the_outputs_panel() {
+        let mut app = app();
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(press(&mut app, KeyCode::Char('3')), Action::None);
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_from_the_help() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Quit
         );
     }
 

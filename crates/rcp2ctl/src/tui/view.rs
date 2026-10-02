@@ -10,7 +10,7 @@ use ratatui::widgets::{
 use rcp2_audio::{Channel, PersistState};
 
 use super::app::{App, Focus, Level};
-use crate::target_label;
+use crate::{channel_of, output_label};
 
 /// Golden yellow accent.
 const ACCENT: Color = Color::Rgb(255, 191, 0);
@@ -19,7 +19,8 @@ const ACCENT: Color = Color::Rgb(255, 191, 0);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Mode {
     pub(crate) outputs_on: bool,
-    pub(crate) persist: PersistState,
+    /// `None` if the state could not be read (the error is shown separately).
+    pub(crate) persist: Option<PersistState>,
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
@@ -53,9 +54,10 @@ fn header_line(app: &App, mode: Mode) -> Paragraph<'static> {
         Span::styled("RØDECaster Pro II not found", Style::new().fg(Color::Red))
     };
     let outputs = match (mode.persist, mode.outputs_on) {
-        (PersistState::On, _) => "outputs: on, kept by config file",
-        (_, true) => "outputs: on, created at launch",
-        (_, false) => "outputs: off",
+        (None, _) => "outputs: ? (cannot read the config state)",
+        (Some(PersistState::On), _) => "outputs: on, kept by config file",
+        (Some(_), true) => "outputs: on, created at launch",
+        (Some(_), false) => "outputs: off",
     };
     let default = default_channel(app).map_or_else(
         || {
@@ -76,17 +78,11 @@ fn header_line(app: &App, mode: Mode) -> Paragraph<'static> {
     ]))
 }
 
-/// The named output the system's default output plays on: our own sink, or
-/// the board's native stereo sink, which is the Chat channel too.
+/// The named output the system's default output plays on.
 fn default_channel(app: &App) -> Option<Channel> {
     let default = app.graph.default_sink()?;
-    Channel::from_sink_name(default).or_else(|| {
-        app.graph
-            .rode()
-            .ok()
-            .filter(|rode| rode.stereo_sink == default)
-            .map(|_| Channel::Chat)
-    })
+    let node = app.graph.nodes().iter().find(|node| node.name == default)?;
+    channel_of(&app.graph, node)
 }
 
 fn panel(title: &str, focused: bool) -> Block<'_> {
@@ -112,7 +108,7 @@ fn render_outputs(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     stream
                         .targets
                         .iter()
-                        .any(|node| Channel::from_sink_name(&node.name) == Some(channel))
+                        .any(|node| channel_of(&app.graph, node) == Some(channel))
                 })
                 .count();
             let mut spans = vec![
@@ -148,16 +144,7 @@ fn render_apps(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     }
     let rows = streams.iter().map(|stream| {
-        let output = if stream.targets.is_empty() {
-            "(not connected)".to_owned()
-        } else {
-            stream
-                .targets
-                .iter()
-                .map(|node| target_label(node))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+        let output = output_label(&app.graph, stream);
         Row::new(vec![
             Cell::from(stream.node.id.to_string()),
             Cell::from(
@@ -270,7 +257,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
         let mode = Mode {
             outputs_on: true,
-            persist: PersistState::Off,
+            persist: Some(PersistState::Off),
         };
         terminal.draw(|frame| render(frame, app, mode)).unwrap();
         let buffer = terminal.backend().buffer();

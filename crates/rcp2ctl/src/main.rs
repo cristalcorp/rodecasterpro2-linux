@@ -111,6 +111,10 @@ enum CliError {
     PersistentOutputs,
     #[error("uninstall finished with {0} problem(s), reported above")]
     UninstallIncomplete(usize),
+    #[error("the interactive interface needs a terminal; see `rcp2ctl --help` for commands")]
+    NoTerminal,
+    #[error("cannot read whether persistence is on; nothing was changed")]
+    PersistStateUnknown,
     #[error("cannot write output: {0}")]
     Output(#[from] io::Error),
 }
@@ -120,7 +124,8 @@ fn main() -> ExitCode {
     let mut out = io::stdout().lock();
     let result = match cli.command {
         Some(command) => run(command, &mut out),
-        None => tui::run(),
+        None if io::stdin().is_terminal() && io::stdout().is_terminal() => tui::run(),
+        None => Err(CliError::NoTerminal),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -145,7 +150,13 @@ fn run(command: Command, out: &mut impl Write) -> Result<(), CliError> {
         } => uninstall(yes, keep_pipewire_config, out),
         Command::Outputs { state } => {
             let path = settings::settings_path()?;
-            outputs(&path, &mut settings::load(&path)?, state, out)
+            outputs(
+                &path,
+                &mut settings::load(&path)?,
+                state,
+                out,
+                &mut notice_to_stderr,
+            )
         }
         Command::Status => {
             let settings = load_settings()?;
@@ -170,15 +181,20 @@ fn outputs(
     settings: &mut Settings,
     state: Switch,
     out: &mut impl Write,
+    notice: &mut dyn FnMut(&str),
 ) -> Result<(), CliError> {
     if state == Switch::Off && persist_state(&PersistPaths::from_env()?)? == PersistState::On {
         return Err(CliError::PersistentOutputs);
     }
-    settings.outputs = state == Switch::On;
-    settings::save(settings_path, settings)?;
+    // Saved first: the in-memory settings only change once the file has.
+    let updated = Settings {
+        outputs: state == Switch::On,
+    };
+    settings::save(settings_path, &updated)?;
+    *settings = updated;
     if state == Switch::On {
-        for notice in restore_outputs(settings)?.notices() {
-            writeln!(out, "{notice}.")?;
+        for text in restore_outputs(settings)?.notices() {
+            notice(&text);
         }
         writeln!(out, "Named outputs on (created at each launch).")?;
         return Ok(());
@@ -192,6 +208,12 @@ fn outputs(
     Ok(())
 }
 
+/// Prints a notice on stderr, keeping command output data only.
+fn notice_to_stderr(text: &str) {
+    // Nothing sensible is left to do if stderr itself is unwritable.
+    let _ = writeln!(io::stderr().lock(), "rcp2ctl: {text}");
+}
+
 /// How long to wait for outputs created through `pactl` to show up in the graph.
 const APPEAR_ATTEMPTS: u32 = 20;
 const APPEAR_INTERVAL: Duration = Duration::from_millis(50);
@@ -201,9 +223,8 @@ const APPEAR_INTERVAL: Duration = Duration::from_millis(50);
 /// stderr so that command output stays data only.
 fn prepare(settings: &Settings) -> Result<Graph, CliError> {
     let restored = restore_outputs(settings)?;
-    let mut err = io::stderr().lock();
     for notice in restored.notices() {
-        let _ = writeln!(err, "rcp2ctl: {notice}");
+        notice_to_stderr(&notice);
     }
     Ok(restored.graph)
 }
@@ -485,10 +506,22 @@ fn uninstall(yes: bool, keep_pipewire_config: bool, out: &mut impl Write) -> Res
     Ok(())
 }
 
-/// Name to show for a node an application plays to: our label for our own
-/// outputs, the node description otherwise.
-fn target_label(node: &rcp2_audio::Node) -> String {
-    Channel::from_sink_name(&node.name).map_or_else(
+/// The named output a node plays on: one of our sinks, or the board's native
+/// stereo sink, which is the Chat channel too.
+fn channel_of(graph: &Graph, node: &rcp2_audio::Node) -> Option<Channel> {
+    Channel::from_sink_name(&node.name).or_else(|| {
+        graph
+            .rode()
+            .ok()
+            .filter(|rode| rode.stereo_sink == node.name)
+            .map(|_| Channel::Chat)
+    })
+}
+
+/// Name to show for a node an application plays to: the channel's label for
+/// the board's outputs, the node description otherwise.
+fn target_label(graph: &Graph, node: &rcp2_audio::Node) -> String {
+    channel_of(graph, node).map_or_else(
         || {
             node.description
                 .clone()
@@ -496,6 +529,19 @@ fn target_label(node: &rcp2_audio::Node) -> String {
         },
         Channel::description,
     )
+}
+
+/// The OUTPUT column of the applications list, shared by the CLI and the TUI.
+fn output_label(graph: &Graph, stream: &rcp2_audio::AppStream<'_>) -> String {
+    if stream.targets.is_empty() {
+        return "(not connected)".to_owned();
+    }
+    stream
+        .targets
+        .iter()
+        .map(|node| target_label(graph, node))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn apps(graph: &Graph, out: &mut impl Write) -> Result<(), CliError> {
@@ -510,16 +556,7 @@ fn apps(graph: &Graph, out: &mut impl Write) -> Result<(), CliError> {
         "ID", "BINARY", "APPLICATION", "OUTPUT"
     )?;
     for stream in &streams {
-        let output = if stream.targets.is_empty() {
-            "(not connected)".to_owned()
-        } else {
-            stream
-                .targets
-                .iter()
-                .map(|node| target_label(node))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+        let output = output_label(graph, stream);
         writeln!(
             out,
             "{:>6}  {:<16}  {:<24}  {:<24}  {}",
