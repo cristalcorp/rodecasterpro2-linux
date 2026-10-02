@@ -106,19 +106,38 @@ fn write_temp(path: &Path, contents: &[u8]) -> Result<PathBuf, PwError> {
 /// Returns [`PwError::Io`] if a directory or file cannot be created, written or
 /// renamed; `path` is then left untouched.
 pub fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), PwError> {
+    replace_file(path, contents, None)
+}
+
+/// [`write_atomically`], with `permissions` applied to the temporary file
+/// before the rename: the content is never visible with other permissions.
+fn replace_file(
+    path: &Path,
+    contents: &[u8],
+    permissions: Option<&fs::Permissions>,
+) -> Result<(), PwError> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(io_err(dir))?;
     }
     let tmp = write_temp(path, contents)?;
-    fs::rename(&tmp, path).map_err(|err| {
+    let result = match permissions {
+        Some(permissions) => fs::set_permissions(&tmp, permissions.clone()).map_err(io_err(&tmp)),
+        None => Ok(()),
+    }
+    .and_then(|()| fs::rename(&tmp, path).map_err(io_err(path)));
+    if result.is_err() {
         let _ = fs::remove_file(&tmp);
-        io_err(path)(err)
-    })
+    }
+    result
 }
 
 /// Refuses a symlink at `path`: whoever manages the link (a dotfiles repo, a
 /// read-only Nix store…) owns its content.
-fn refuse_symlink(path: &Path) -> Result<(), PwError> {
+///
+/// # Errors
+///
+/// Returns [`PwError::Symlink`] if `path` is a symlink.
+pub fn refuse_symlink(path: &Path) -> Result<(), PwError> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(PwError::Symlink(path.to_owned())),
         _ => Ok(()),
@@ -217,14 +236,14 @@ enum Original {
     Absent,
     Content {
         contents: Vec<u8>,
-        permissions: Option<fs::Permissions>,
+        permissions: fs::Permissions,
     },
 }
 
 fn read_snapshot(paths: &PersistPaths) -> Result<Option<Original>, PwError> {
     let file = paths.snapshot_file();
     if let Some(contents) = read_optional(&file)? {
-        let permissions = fs::metadata(&file).ok().map(|meta| meta.permissions());
+        let permissions = fs::metadata(&file).map_err(io_err(&file))?.permissions();
         return Ok(Some(Original::Content {
             contents,
             permissions,
@@ -242,20 +261,8 @@ fn write_snapshot(paths: &PersistPaths, original: &Original) -> Result<(), PwErr
         Original::Content {
             contents,
             permissions,
-        } => write_with_permissions(&paths.snapshot_file(), contents, permissions.as_ref()),
+        } => replace_file(&paths.snapshot_file(), contents, Some(permissions)),
     }
-}
-
-fn write_with_permissions(
-    path: &Path,
-    contents: &[u8],
-    permissions: Option<&fs::Permissions>,
-) -> Result<(), PwError> {
-    write_atomically(path, contents)?;
-    if let Some(permissions) = permissions {
-        fs::set_permissions(path, permissions.clone()).map_err(io_err(path))?;
-    }
-    Ok(())
 }
 
 /// Puts the original back at the config path; `false` if it was "no file".
@@ -265,7 +272,7 @@ fn restore_original(paths: &PersistPaths, original: &Original) -> Result<bool, P
             contents,
             permissions,
         } => {
-            write_with_permissions(&paths.config_file, contents, permissions.as_ref())?;
+            replace_file(&paths.config_file, contents, Some(permissions))?;
             Ok(true)
         }
         Original::Absent => Ok(false),
@@ -326,8 +333,8 @@ pub fn enable_persistence(paths: &PersistPaths, contents: &str) -> Result<Enable
                 Some(contents) if !is_ours(&contents) => Original::Content {
                     contents,
                     permissions: fs::metadata(&paths.config_file)
-                        .ok()
-                        .map(|meta| meta.permissions()),
+                        .map_err(io_err(&paths.config_file))?
+                        .permissions(),
                 },
                 _ => Original::Absent,
             };
@@ -366,31 +373,28 @@ pub enum DisableOutcome {
 /// [`PwError::Io`] on filesystem errors.
 pub fn disable_persistence(paths: &PersistPaths) -> Result<DisableOutcome, PwError> {
     refuse_symlink(&paths.config_file)?;
-    match read_optional(&paths.config_file)? {
-        None => {
-            // Our file was removed by hand: still put a recorded original back.
-            let outcome = match read_snapshot(paths)? {
-                Some(original) if restore_original(paths, &original)? => DisableOutcome::Restored,
-                _ => DisableOutcome::AlreadyOff,
-            };
-            clear_snapshot(paths)?;
-            Ok(outcome)
-        }
-        Some(current) if !is_ours(&current) => {
-            Err(PwError::ModifiedOutside(paths.config_file.clone()))
-        }
-        Some(_) => {
-            let outcome = match read_snapshot(paths)? {
-                Some(original) if restore_original(paths, &original)? => DisableOutcome::Restored,
-                _ => {
-                    remove_file_if_present(&paths.config_file)?;
-                    DisableOutcome::Removed
-                }
-            };
-            clear_snapshot(paths)?;
-            Ok(outcome)
-        }
+    let current = read_optional(&paths.config_file)?;
+    if current
+        .as_deref()
+        .is_some_and(|contents| !is_ours(contents))
+    {
+        return Err(PwError::ModifiedOutside(paths.config_file.clone()));
     }
+    // Also when our file was removed by hand: a recorded original goes back.
+    let restored = match read_snapshot(paths)? {
+        Some(original) => restore_original(paths, &original)?,
+        None => false,
+    };
+    let outcome = if restored {
+        DisableOutcome::Restored
+    } else if current.is_some() {
+        remove_file_if_present(&paths.config_file)?;
+        DisableOutcome::Removed
+    } else {
+        DisableOutcome::AlreadyOff
+    };
+    clear_snapshot(paths)?;
+    Ok(outcome)
 }
 
 #[cfg(test)]

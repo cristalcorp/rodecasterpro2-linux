@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rcp2_audio::{APP_DIR, PwError, config_home, write_atomically};
+use rcp2_audio::{APP_DIR, PwError, config_home, refuse_symlink, write_atomically};
 use serde::{Deserialize, Serialize};
 
 /// Error while reading or writing the settings file.
@@ -20,8 +20,6 @@ pub(crate) enum SettingsError {
         path: PathBuf,
         source: toml::de::Error,
     },
-    #[error("{0} is a symlink, so it is managed elsewhere: edit its target instead")]
-    Symlink(PathBuf),
     #[error("cannot serialise the settings: {0}")]
     Serialise(#[from] toml::ser::Error),
 }
@@ -64,9 +62,7 @@ pub(crate) fn load(path: &Path) -> Result<Settings, SettingsError> {
 /// Saves the settings atomically.
 pub(crate) fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
     // Replacing a symlink with a plain file would detach it from its manager.
-    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Err(SettingsError::Symlink(path.to_owned()));
-    }
+    refuse_symlink(path)?;
     let text = toml::to_string(settings)?;
     write_atomically(path, text.as_bytes())?;
     Ok(())

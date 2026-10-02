@@ -28,7 +28,7 @@ pub use config::{CONFIG_FILE_NAME, GENERATED_MARKER, UnsafeNodeName, pipewire_co
 pub use graph::{AppStream, DetectError, Graph, Node, ParseError, Rode};
 pub use persist::{
     APP_DIR, DisableOutcome, EnableOutcome, PersistPaths, PersistState, config_home, data_home,
-    disable_persistence, enable_persistence, original_recorded, persist_state,
+    disable_persistence, enable_persistence, original_recorded, persist_state, refuse_symlink,
     remove_file_if_present, write_atomically,
 };
 pub use pw::{PwError, move_stream, snapshot};
