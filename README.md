@@ -33,11 +33,44 @@ everything else. This project aims to:
 | Crate | Role |
 |---|---|
 | `rcp2-proto` | Pure codec for the HID control protocol (no I/O, fuzzable) |
+| `rcp2-audio` | PipeWire side: board detection, named outputs, app routing |
 | `rcp2ctl` | Command-line tool, then TUI |
 
 ## Status
 
-Bootstrapping. Nothing talks to the device yet.
+Named outputs and app routing work (PipeWire side). Nothing talks to the
+board's HID control interface yet.
+
+## Usage
+
+Requirements: PipeWire with WirePlumber, and the board in the **Pro Audio**
+profile (pavucontrol, *Configuration* tab).
+
+```sh
+cargo build --release
+target/release/rcp2ctl status              # board + named outputs
+target/release/rcp2ctl config --install    # declare the outputs (backs up any previous file)
+systemctl --user restart pipewire pipewire-pulse wireplumber
+target/release/rcp2ctl apps                # who plays where
+target/release/rcp2ctl route firefox game  # remembered for the app's next runs
+```
+
+The board's USB playback channels, as verified on hardware (firmware-dependent):
+
+| Output | Native sink | Channels |
+|---|---|---|
+| RØDE Chat | `pro-output-0` (2 ch) | AUX0–AUX1 |
+| RØDE USB1 | `pro-output-1` (10 ch) | AUX0–AUX1 |
+| RØDE Game | `pro-output-1` | AUX2–AUX3 |
+| RØDE Music | `pro-output-1` | AUX4–AUX5 |
+| RØDE A | `pro-output-1` | AUX6–AUX7 |
+| RØDE B | `pro-output-1` | AUX8–AUX9 |
+
+Outputs are named after the board's channels, not its faders: any channel can be
+assigned to any fader on the board.
+
+To undo: delete `~/.config/pipewire/pipewire.conf.d/50-rodecaster-virtual-sinks.conf`
+and restart PipeWire as above.
 
 ## Prior art and credits
 

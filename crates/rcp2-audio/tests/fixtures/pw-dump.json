@@ -1,0 +1,172 @@
+[
+  {
+    "id": 0,
+    "type": "PipeWire:Interface:Core",
+    "info": { "name": "pipewire-0" }
+  },
+  {
+    "id": 30,
+    "type": "PipeWire:Interface:Metadata",
+    "props": { "metadata.name": "default" },
+    "metadata": []
+  },
+  {
+    "id": 40,
+    "type": "PipeWire:Interface:Device",
+    "info": {
+      "props": {
+        "device.name": "alsa_card.pci-0000_00_1f.3",
+        "device.vendor.id": "0x8086",
+        "device.product.name": "HD Audio Controller"
+      }
+    }
+  },
+  {
+    "id": 72,
+    "type": "PipeWire:Interface:Device",
+    "info": {
+      "props": {
+        "device.name": "alsa_card.usb-R__DE_RODECaster_Pro_II_TESTSERIAL-00",
+        "device.vendor.id": "0x19f7",
+        "device.product.id": "0x0078",
+        "device.product.name": "RODECaster Pro II"
+      }
+    }
+  },
+  {
+    "id": 84,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 84,
+        "node.name": "alsa_output.pci-0000_00_1f.3.analog-stereo",
+        "media.class": "Audio/Sink",
+        "device.id": 40,
+        "audio.channels": 2
+      }
+    }
+  },
+  {
+    "id": 88,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 88,
+        "node.name": "alsa_output.usb-R__DE_RODECaster_Pro_II_TESTSERIAL-00.pro-output-0",
+        "node.description": "RODECaster Pro II Pro",
+        "media.class": "Audio/Sink",
+        "device.id": 72,
+        "device.profile.name": "pro-output-0",
+        "audio.channels": 2
+      }
+    }
+  },
+  {
+    "id": 89,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 89,
+        "node.name": "alsa_output.usb-R__DE_RODECaster_Pro_II_TESTSERIAL-00.pro-output-1",
+        "node.description": "RODECaster Pro II Pro 1",
+        "media.class": "Audio/Sink",
+        "device.id": 72,
+        "device.profile.name": "pro-output-1",
+        "audio.channels": 10
+      }
+    }
+  },
+  {
+    "id": 65,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 65,
+        "node.name": "alsa_input.usb-R__DE_RODECaster_Pro_II_TESTSERIAL-00.pro-input-0",
+        "media.class": "Audio/Source",
+        "device.id": 72,
+        "device.profile.name": "pro-input-0",
+        "audio.channels": 2
+      }
+    }
+  },
+  {
+    "id": 54,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 154,
+        "node.name": "rcp2.game",
+        "node.description": "RØDE Game",
+        "media.class": "Audio/Sink"
+      }
+    }
+  },
+  {
+    "id": 53,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 153,
+        "node.name": "rcp2.game.output",
+        "media.class": "Stream/Output/Audio",
+        "media.name": "RØDE Game output"
+      }
+    }
+  },
+  {
+    "id": 300,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": "415",
+        "node.name": "Firefox",
+        "media.class": "Stream/Output/Audio",
+        "application.name": "Firefox",
+        "application.process.binary": "firefox",
+        "media.name": "Some video"
+      }
+    }
+  },
+  {
+    "id": 301,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "object.serial": 416,
+        "node.name": "spotify",
+        "media.class": "Stream/Output/Audio",
+        "application.process.binary": "spotify"
+      }
+    }
+  },
+  {
+    "id": 302,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "media.class": "Stream/Output/Audio"
+      }
+    }
+  },
+  {
+    "id": 500,
+    "type": "PipeWire:Interface:Link",
+    "info": { "output-node-id": 300, "input-node-id": 88 }
+  },
+  {
+    "id": 501,
+    "type": "PipeWire:Interface:Link",
+    "info": { "output-node-id": 300, "input-node-id": 88 }
+  },
+  {
+    "id": 502,
+    "type": "PipeWire:Interface:Link",
+    "info": { "output-node-id": 53, "input-node-id": 89 }
+  },
+  {
+    "id": 503,
+    "type": "PipeWire:Interface:Link",
+    "info": { "output-node-id": 301, "input-node-id": 54 }
+  }
+]
