@@ -5,14 +5,12 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::channel::{Channel, NativeSink};
+use crate::channel::{Channel, NativeSink, OWN_NODE_PREFIX};
 
 /// USB vendor ID of RØDE Microphones, as PipeWire reports it.
 const RODE_VENDOR_ID: &str = "0x19f7";
 /// `device.product.name` of the board.
 const PRODUCT_NAME: &str = "RODECaster Pro II";
-/// Prefix of every node this project creates.
-const OWN_NODE_PREFIX: &str = "rcp2.";
 
 /// Error while parsing `pw-dump` output.
 #[derive(Debug, thiserror::Error)]
@@ -124,15 +122,15 @@ pub struct AppStream<'a> {
 }
 
 impl AppStream<'_> {
-    /// Name to show for the application. The process binary comes first because
-    /// it is what [`AppStream::matches`] accepts and what users type; the
-    /// application name can be generic (e.g. `PipeWire ALSA [qbz]`).
+    /// Name to show for the application: its name, else its process binary,
+    /// else the node name. Several apps can share a binary (Wine, Electron), so
+    /// callers should show the binary too and offer the ID to pick one stream.
     #[must_use]
     pub fn app_label(&self) -> &str {
         self.node
-            .process_binary
+            .app_name
             .as_deref()
-            .or(self.node.app_name.as_deref())
+            .or(self.node.process_binary.as_deref())
             .unwrap_or(&self.node.name)
     }
 
@@ -206,8 +204,9 @@ impl Graph {
     pub fn from_pw_dump(json: &str) -> Result<Self, ParseError> {
         let objects: Vec<RawObject> = serde_json::from_str(json)?;
         let mut graph = Self::default();
-        let mut clients: HashMap<u64, Map<String, Value>> = HashMap::new();
-        let mut node_clients: Vec<Option<u64>> = Vec::new();
+        // (application.name, application.process.binary) per client.
+        let mut clients: HashMap<u64, (Option<String>, Option<String>)> = HashMap::new();
+        let mut nodes: Vec<(Node, Option<u64>)> = Vec::new();
         for object in objects {
             let Some(info) = object.info else { continue };
             match object.kind.as_str() {
@@ -216,8 +215,7 @@ impl Graph {
                     let Some(name) = prop_str(&props, "node.name") else {
                         continue;
                     };
-                    node_clients.push(prop_u64(&props, "client.id"));
-                    graph.nodes.push(Node {
+                    let node = Node {
                         id: object.id,
                         serial: prop_u64(&props, "object.serial"),
                         name,
@@ -230,7 +228,8 @@ impl Graph {
                         process_binary: prop_str(&props, "application.process.binary"),
                         media_name: prop_str(&props, "media.name"),
                         internal: props.contains_key("node.link-group"),
-                    });
+                    };
+                    nodes.push((node, prop_u64(&props, "client.id")));
                 }
                 "PipeWire:Interface:Device" => {
                     let Some(props) = info.props else { continue };
@@ -242,7 +241,13 @@ impl Graph {
                 }
                 "PipeWire:Interface:Client" => {
                     if let Some(props) = info.props {
-                        clients.insert(u64::from(object.id), props);
+                        clients.insert(
+                            u64::from(object.id),
+                            (
+                                prop_str(&props, "application.name"),
+                                prop_str(&props, "application.process.binary"),
+                            ),
+                        );
                     }
                 }
                 "PipeWire:Interface:Link" => {
@@ -259,16 +264,16 @@ impl Graph {
             }
         }
         // Clients may appear before or after their nodes: resolve once all are read.
-        for (node, client_id) in graph.nodes.iter_mut().zip(node_clients) {
-            let Some(client) = client_id.and_then(|id| clients.get(&id)) else {
-                continue;
-            };
-            if node.app_name.is_none() {
-                node.app_name = prop_str(client, "application.name");
+        for (mut node, client_id) in nodes {
+            if let Some((app_name, binary)) = client_id.and_then(|id| clients.get(&id)) {
+                if node.app_name.is_none() {
+                    node.app_name.clone_from(app_name);
+                }
+                if node.process_binary.is_none() {
+                    node.process_binary.clone_from(binary);
+                }
             }
-            if node.process_binary.is_none() {
-                node.process_binary = prop_str(client, "application.process.binary");
-            }
+            graph.nodes.push(node);
         }
         Ok(graph)
     }
@@ -335,7 +340,7 @@ impl Graph {
     #[must_use]
     pub fn virtual_sink(&self, channel: Channel) -> Option<&Node> {
         self.nodes.iter().find(|node| {
-            node.name.strip_prefix(OWN_NODE_PREFIX) == Some(channel.id())
+            Channel::from_sink_name(&node.name) == Some(channel)
                 && node.media_class.as_deref() == Some("Audio/Sink")
         })
     }

@@ -79,7 +79,7 @@ fn lists_app_streams_without_our_own_loopbacks() {
         .collect();
     // Skipped: the node without a name, our rcp2.game.output loopback, and the
     // filter chain's internal stream (it has a node.link-group).
-    assert_eq!(labels, ["firefox", "spotify", "qbz"]);
+    assert_eq!(labels, ["Firefox", "spotify", "PipeWire ALSA [qbz]"]);
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn reports_where_each_app_plays_once_per_target() {
             .collect()
     };
     // Two links (one per channel) to the same sink count once.
-    assert_eq!(targets("firefox"), [STEREO]);
+    assert_eq!(targets("Firefox"), [STEREO]);
     assert_eq!(targets("spotify"), ["rcp2.game"]);
 }
 

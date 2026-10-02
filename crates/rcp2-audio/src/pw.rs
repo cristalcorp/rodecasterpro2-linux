@@ -32,6 +32,12 @@ pub enum PwError {
     /// `pw-dump` printed something unexpected.
     #[error(transparent)]
     Parse(#[from] ParseError),
+    /// The config path is a symlink: it is managed elsewhere (dotfiles, Nix…).
+    #[error(
+        "{0} is a symlink, so it is managed elsewhere: update its target yourself, \
+         or remove the link and rerun"
+    )]
+    Symlink(PathBuf),
     /// Neither `XDG_CONFIG_HOME` nor `HOME` is usable.
     #[error("cannot locate the config directory: neither XDG_CONFIG_HOME nor HOME is set")]
     NoConfigDir,
@@ -143,13 +149,27 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> PwError + use<> {
     move |source| PwError::Io { path, source }
 }
 
-/// If `path` is a symlink (e.g. managed by a dotfiles tool), returns the file it
-/// points to, so the link itself is preserved.
-fn resolve_symlink(path: &Path) -> Result<PathBuf, PwError> {
+/// Refuses a symlink at `path`: whoever manages the link (a dotfiles repo, a
+/// read-only Nix store…) owns its content, and neither following nor replacing
+/// it is safe in every setup.
+fn refuse_symlink(path: &Path) -> Result<(), PwError> {
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path).map_err(io_err(path)),
-        _ => Ok(path.to_owned()),
+        Ok(meta) if meta.file_type().is_symlink() => Err(PwError::Symlink(path.to_owned())),
+        _ => Ok(()),
     }
+}
+
+/// Writes `contents` to `path` and flushes it to disk. With `create_new`, fails
+/// if `path` already exists; otherwise creates or truncates it.
+fn write_synced(path: &Path, contents: &[u8], create_new: bool) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(!create_new)
+        .create_new(create_new)
+        .truncate(!create_new)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
 }
 
 /// Copies `previous` to a new `<path>.bak-<unix seconds>[-<n>]` file, never
@@ -158,7 +178,7 @@ fn write_backup(path: &Path, previous: &[u8]) -> Result<PathBuf, PwError> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
-    let mut last_err = None;
+    let mut last = None;
     for n in 0..MAX_BACKUPS_PER_SECOND {
         let mut name = path.as_os_str().to_owned();
         if n == 0 {
@@ -167,24 +187,20 @@ fn write_backup(path: &Path, previous: &[u8]) -> Result<PathBuf, PwError> {
             name.push(format!(".bak-{stamp}-{n}"));
         }
         let backup = PathBuf::from(name);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&backup)
-        {
-            Ok(mut file) => {
-                file.write_all(previous)
-                    .and_then(|()| file.sync_all())
-                    .map_err(io_err(&backup))?;
-                return Ok(backup);
+        match write_synced(&backup, previous, true) {
+            Ok(()) => return Ok(backup),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => last = Some((backup, err)),
+            Err(err) => {
+                // A partial backup would look valid: remove it (best effort).
+                let _ = fs::remove_file(&backup);
+                return Err(io_err(&backup)(err));
             }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => last_err = Some(err),
-            Err(err) => return Err(io_err(&backup)(err)),
         }
     }
-    Err(io_err(path)(last_err.unwrap_or_else(|| {
-        io::Error::from(io::ErrorKind::AlreadyExists)
-    })))
+    Err(match last {
+        Some((backup, err)) => io_err(&backup)(err),
+        None => io_err(path)(io::Error::from(io::ErrorKind::AlreadyExists)),
+    })
 }
 
 /// Writes `contents` to `path`, keeping any different previous content as
@@ -192,17 +208,18 @@ fn write_backup(path: &Path, previous: &[u8]) -> Result<PathBuf, PwError> {
 /// inert).
 ///
 /// The previous content is backed up first, then the new file replaces it in a
-/// single atomic rename: at no point is the file missing. A symlink at `path`
-/// is followed and preserved.
+/// single atomic rename of a file already flushed to disk: at no point is the
+/// file missing or partial.
 ///
 /// Does not restart PipeWire: the caller tells the user how to apply it.
 ///
 /// # Errors
 ///
-/// Returns [`PwError::Io`] if a directory or file cannot be read, created,
-/// renamed or written. On error the existing file is left untouched.
+/// Returns [`PwError::Symlink`] if `path` is a symlink, and [`PwError::Io`] if
+/// a directory or file cannot be read, created, renamed or written. On error
+/// the existing file is left untouched.
 pub fn install_config(path: &Path, contents: &str) -> Result<InstallOutcome, PwError> {
-    let path = &resolve_symlink(path)?;
+    refuse_symlink(path)?;
     let previous = match fs::read(path) {
         Ok(previous) => Some(previous),
         Err(err) if err.kind() == io::ErrorKind::NotFound => None,
@@ -223,7 +240,7 @@ pub fn install_config(path: &Path, contents: &str) -> Result<InstallOutcome, PwE
     };
 
     let tmp = path.with_extension("conf.tmp");
-    let written = fs::write(&tmp, contents)
+    let written = write_synced(&tmp, contents.as_bytes(), false)
         .map_err(io_err(&tmp))
         .and_then(|()| fs::rename(&tmp, path).map_err(io_err(path)));
     if written.is_err() {
@@ -235,7 +252,7 @@ pub fn install_config(path: &Path, contents: &str) -> Result<InstallOutcome, PwE
 
 #[cfg(test)]
 mod tests {
-    use super::{InstallOutcome, install_config};
+    use super::{InstallOutcome, PwError, install_config};
     use std::fs;
     use std::path::PathBuf;
 
@@ -305,16 +322,25 @@ mod tests {
     }
 
     #[test]
-    fn writes_through_a_symlink_and_keeps_it() {
+    fn refuses_symlinks_and_touches_nothing() {
         let dir = scratch_dir("symlink");
         let real = dir.join("dotfiles").join("50-test.conf");
         let link = dir.join("pipewire.conf.d").join("50-test.conf");
+        let dangling = dir.join("pipewire.conf.d").join("51-test.conf");
         fs::create_dir_all(real.parent().unwrap()).unwrap();
         fs::create_dir_all(link.parent().unwrap()).unwrap();
         fs::write(&real, "old").unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing.conf"), &dangling).unwrap();
 
-        install_config(&link, "new").unwrap();
+        assert!(matches!(
+            install_config(&link, "new"),
+            Err(PwError::Symlink(_))
+        ));
+        assert!(matches!(
+            install_config(&dangling, "new"),
+            Err(PwError::Symlink(_))
+        ));
 
         assert!(
             fs::symlink_metadata(&link)
@@ -322,7 +348,8 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&real).unwrap(), "old");
+        assert_eq!(fs::read_dir(link.parent().unwrap()).unwrap().count(), 2);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

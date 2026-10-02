@@ -140,12 +140,17 @@ fn config(graph: &Graph, install: bool, out: &mut impl Write) -> Result<(), CliE
     Ok(())
 }
 
-/// Name to show for a node an application plays to (our outputs carry their
-/// `RØDE <channel>` label in `node.description`).
+/// Name to show for a node an application plays to: our label for our own
+/// outputs, the node description otherwise.
 fn target_label(node: &rcp2_audio::Node) -> String {
-    node.description
-        .clone()
-        .unwrap_or_else(|| node.name.clone())
+    Channel::from_sink_name(&node.name).map_or_else(
+        || {
+            node.description
+                .clone()
+                .unwrap_or_else(|| node.name.clone())
+        },
+        Channel::description,
+    )
 }
 
 fn apps(graph: &Graph, out: &mut impl Write) -> Result<(), CliError> {
@@ -156,8 +161,8 @@ fn apps(graph: &Graph, out: &mut impl Write) -> Result<(), CliError> {
     }
     writeln!(
         out,
-        "{:>6}  {:<20}  {:<24}  MEDIA",
-        "ID", "APPLICATION", "OUTPUT"
+        "{:>6}  {:<16}  {:<24}  {:<12}  MEDIA",
+        "ID", "BINARY", "APPLICATION", "OUTPUT"
     )?;
     for stream in &streams {
         let output = if stream.targets.is_empty() {
@@ -172,13 +177,18 @@ fn apps(graph: &Graph, out: &mut impl Write) -> Result<(), CliError> {
         };
         writeln!(
             out,
-            "{:>6}  {:<20}  {:<24}  {}",
+            "{:>6}  {:<16}  {:<24}  {:<12}  {}",
             stream.node.id,
+            stream.node.process_binary.as_deref().unwrap_or("-"),
             stream.app_label(),
             output,
             stream.node.media_name.as_deref().unwrap_or("")
         )?;
     }
+    writeln!(
+        out,
+        "Route by ID, binary or application name; an ID picks a single stream."
+    )?;
     Ok(())
 }
 
@@ -200,8 +210,12 @@ fn route(
     if streams.is_empty() {
         return Err(CliError::NoSuchApp(selector.to_owned()));
     }
+    // Move every stream before printing: a closed stdout must not leave the
+    // routing half done.
     for stream in &streams {
         move_stream(stream.node.id, serial)?;
+    }
+    for stream in &streams {
         writeln!(
             out,
             "{} (stream {}) -> {}",

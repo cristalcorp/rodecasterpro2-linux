@@ -3,6 +3,9 @@
 use std::fmt;
 use std::str::FromStr;
 
+/// Prefix of every node this project creates.
+pub(crate) const OWN_NODE_PREFIX: &str = "rcp2.";
+
 /// Native PipeWire sink exposed by the board in the `pro-audio` profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NativeSink {
@@ -114,7 +117,14 @@ impl Channel {
     /// `node.name` of the named virtual sink for this channel.
     #[must_use]
     pub fn sink_name(self) -> String {
-        format!("rcp2.{}", self.id())
+        format!("{OWN_NODE_PREFIX}{}", self.id())
+    }
+
+    /// The channel whose named sink is `node_name`, if any.
+    #[must_use]
+    pub fn from_sink_name(node_name: &str) -> Option<Self> {
+        let id = node_name.strip_prefix(OWN_NODE_PREFIX)?;
+        Self::ALL.into_iter().find(|channel| channel.id() == id)
     }
 
     /// `node.description` of the named virtual sink, as shown in desktop mixers.
@@ -184,7 +194,9 @@ mod tests {
     fn every_id_round_trips() {
         for channel in Channel::ALL {
             assert_eq!(channel.id().parse::<Channel>().unwrap(), channel);
+            assert_eq!(Channel::from_sink_name(&channel.sink_name()), Some(channel));
         }
+        assert_eq!(Channel::from_sink_name("rcp2.game.output"), None);
     }
 
     #[test]
