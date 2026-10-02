@@ -31,5 +31,5 @@ pub use persist::{
     disable_persistence, enable_persistence, original_recorded, persist_state, refuse_symlink,
     remove_file_if_present, write_atomically,
 };
-pub use pw::{PwError, move_stream, snapshot};
+pub use pw::{PwError, move_stream, set_default_sink, snapshot};
 pub use runtime::{create_runtime_outputs, remap_sink_args, remove_runtime_outputs};

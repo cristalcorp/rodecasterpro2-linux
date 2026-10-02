@@ -1,6 +1,7 @@
 //! `rcp2ctl`: Linux control tool for the RØDECaster Pro II.
 
 mod settings;
+mod tui;
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -12,7 +13,7 @@ use rcp2_audio::{
     APP_DIR, Channel, DetectError, DisableOutcome, EnableOutcome, Graph, PersistPaths,
     PersistState, PwError, UnsafeNodeName, create_runtime_outputs, data_home, disable_persistence,
     enable_persistence, move_stream, original_recorded, persist_state, pipewire_config,
-    refuse_symlink, remove_file_if_present, remove_runtime_outputs, snapshot,
+    refuse_symlink, remove_file_if_present, remove_runtime_outputs, set_default_sink, snapshot,
 };
 use settings::{Settings, SettingsError};
 
@@ -23,8 +24,9 @@ use settings::{Settings, SettingsError};
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Without a command, opens the interactive interface.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -57,6 +59,11 @@ enum Command {
     Persist {
         /// `on` or `off`.
         state: Switch,
+    },
+    /// Make a named output the system's default output (remembered by WirePlumber).
+    Default {
+        /// Named output.
+        channel: Channel,
     },
     /// Undo everything rcp2ctl did, before removing the binary.
     Uninstall {
@@ -111,7 +118,11 @@ enum CliError {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let mut out = io::stdout().lock();
-    match run(cli.command, &mut out) {
+    let result = match cli.command {
+        Some(command) => run(command, &mut out),
+        None => tui::run(),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         // The reader went away (e.g. `rcp2ctl apps | head -1`): not an error.
         Err(CliError::Output(err)) if err.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
@@ -142,6 +153,7 @@ fn run(command: Command, out: &mut impl Write) -> Result<(), CliError> {
         }
         Command::Apps => apps(&prepare(&load_settings()?)?, out),
         Command::Route { app, channel } => route(&prepare(&load_settings()?)?, &app, channel, out),
+        Command::Default { channel } => set_default(&prepare(&load_settings()?)?, channel, out),
         Command::Persist { state } => {
             let settings = load_settings()?;
             persist(&prepare(&settings)?, &settings, state, out)
@@ -165,7 +177,9 @@ fn outputs(
     settings.outputs = state == Switch::On;
     settings::save(settings_path, settings)?;
     if state == Switch::On {
-        prepare(settings)?;
+        for notice in restore_outputs(settings)?.notices() {
+            writeln!(out, "{notice}.")?;
+        }
         writeln!(out, "Named outputs on (created at each launch).")?;
         return Ok(());
     }
@@ -186,46 +200,76 @@ const APPEAR_INTERVAL: Duration = Duration::from_millis(50);
 /// are missing if they are on. Returns an up-to-date graph. Notices go to
 /// stderr so that command output stays data only.
 fn prepare(settings: &Settings) -> Result<Graph, CliError> {
+    let restored = restore_outputs(settings)?;
+    let mut err = io::stderr().lock();
+    for notice in restored.notices() {
+        let _ = writeln!(err, "rcp2ctl: {notice}");
+    }
+    Ok(restored.graph)
+}
+
+/// Outcome of [`restore_outputs`].
+struct Restored {
+    graph: Graph,
+    created: Vec<Channel>,
+    /// Some created outputs were not visible yet when the wait ended.
+    pending: bool,
+}
+
+impl Restored {
+    fn notices(&self) -> Vec<String> {
+        let mut notices = Vec::new();
+        if !self.created.is_empty() {
+            let names: Vec<_> = self.created.iter().map(|channel| channel.label()).collect();
+            notices.push(format!("created named outputs: {}", names.join(", ")));
+        }
+        if self.pending {
+            notices.push("the new outputs are not visible yet; retry in a moment".to_owned());
+        }
+        notices
+    }
+}
+
+/// Creates the missing named outputs if they are on, without printing
+/// anything (the TUI owns the terminal).
+fn restore_outputs(settings: &Settings) -> Result<Restored, CliError> {
     let graph = snapshot()?;
+    let unchanged = |graph| Restored {
+        graph,
+        created: Vec::new(),
+        pending: false,
+    };
     if !settings.outputs {
-        return Ok(graph);
+        return Ok(unchanged(graph));
     }
     // Without the board there is nothing to create: commands report it themselves.
     let Ok(rode) = graph.rode() else {
-        return Ok(graph);
+        return Ok(unchanged(graph));
     };
     let created = create_runtime_outputs(&graph, &rode)?;
     if created.is_empty() {
-        return Ok(graph);
+        return Ok(unchanged(graph));
     }
-    let names: Vec<_> = created.iter().map(|channel| channel.label()).collect();
-    let _ = writeln!(
-        io::stderr().lock(),
-        "rcp2ctl: created named outputs: {}",
-        names.join(", ")
-    );
     // pactl returns before the new nodes are visible to other clients.
-    let mut graph = snapshot()?;
-    for _ in 0..APPEAR_ATTEMPTS {
-        if created
+    let all_visible = |graph: &Graph| {
+        created
             .iter()
             .all(|channel| graph.virtual_sink(*channel).is_some())
-        {
+    };
+    let mut graph = snapshot()?;
+    for _ in 0..APPEAR_ATTEMPTS {
+        if all_visible(&graph) {
             break;
         }
         std::thread::sleep(APPEAR_INTERVAL);
         graph = snapshot()?;
     }
-    if created
-        .iter()
-        .any(|channel| graph.virtual_sink(*channel).is_none())
-    {
-        let _ = writeln!(
-            io::stderr().lock(),
-            "rcp2ctl: the new outputs are not visible yet; retry in a moment if needed"
-        );
-    }
-    Ok(graph)
+    let pending = !all_visible(&graph);
+    Ok(Restored {
+        graph,
+        created,
+        pending,
+    })
 }
 
 fn status(graph: &Graph, settings: &Settings, out: &mut impl Write) -> Result<(), CliError> {
@@ -536,6 +580,19 @@ fn route(
         return Err(CliError::RouteFailed { failed, first });
     }
     printed?;
+    Ok(())
+}
+
+fn set_default(graph: &Graph, channel: Channel, out: &mut impl Write) -> Result<(), CliError> {
+    let sink = graph
+        .virtual_sink(channel)
+        .ok_or(CliError::OutputMissing(channel.label()))?;
+    set_default_sink(sink.id)?;
+    writeln!(
+        out,
+        "{} is now the default output (remembered by WirePlumber).",
+        channel.description()
+    )?;
     Ok(())
 }
 

@@ -1,0 +1,233 @@
+//! TUI state and key handling: pure, no I/O, so it is tested without a terminal.
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use rcp2_audio::{Channel, Graph};
+
+/// Which panel receives the arrow keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Focus {
+    Apps,
+    Outputs,
+}
+
+/// Something the event loop must do in response to a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Action {
+    None,
+    Quit,
+    Refresh,
+    /// Send the stream with this ID to a named output.
+    Route {
+        stream_id: u32,
+        channel: Channel,
+    },
+    /// Make a named output the system's default output.
+    SetDefault(Channel),
+    ToggleOutputs,
+    TogglePersist,
+}
+
+/// Severity of the message shown under the panels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Level {
+    Info,
+    Error,
+}
+
+pub(crate) struct App {
+    pub(crate) graph: Graph,
+    pub(crate) focus: Focus,
+    pub(crate) stream_selected: usize,
+    pub(crate) output_selected: usize,
+    pub(crate) message: Option<(Level, String)>,
+    pub(crate) show_help: bool,
+}
+
+impl App {
+    pub(crate) fn new(graph: Graph) -> Self {
+        Self {
+            graph,
+            focus: Focus::Apps,
+            stream_selected: 0,
+            output_selected: 0,
+            message: None,
+            show_help: false,
+        }
+    }
+
+    /// Replaces the graph, keeping the selection on the same stream when it
+    /// still exists.
+    pub(crate) fn set_graph(&mut self, graph: Graph) {
+        let selected_id = self.selected_stream_id();
+        self.graph = graph;
+        let streams = self.graph.app_streams();
+        self.stream_selected = selected_id
+            .and_then(|id| streams.iter().position(|stream| stream.node.id == id))
+            .unwrap_or_else(|| self.stream_selected.min(streams.len().saturating_sub(1)));
+    }
+
+    pub(crate) fn selected_stream_id(&self) -> Option<u32> {
+        self.graph
+            .app_streams()
+            .get(self.stream_selected)
+            .map(|stream| stream.node.id)
+    }
+
+    pub(crate) fn selected_output(&self) -> Option<Channel> {
+        Channel::ALL.get(self.output_selected).copied()
+    }
+
+    pub(crate) fn on_key(&mut self, key: KeyEvent) -> Action {
+        if key.kind != KeyEventKind::Press {
+            return Action::None;
+        }
+        if self.show_help {
+            // Any key closes the help.
+            self.show_help = false;
+            return Action::None;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if ctrl => Action::Quit,
+            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                Action::None
+            }
+            KeyCode::Char('r') => Action::Refresh,
+            KeyCode::Char('o') => Action::ToggleOutputs,
+            KeyCode::Char('p') => Action::TogglePersist,
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                self.focus = match self.focus {
+                    Focus::Apps => Focus::Outputs,
+                    Focus::Outputs => Focus::Apps,
+                };
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_selection(false);
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_selection(true);
+                Action::None
+            }
+            KeyCode::Char(digit @ '1'..='9') => self.route_to_digit(digit),
+            KeyCode::Enter | KeyCode::Char('d') if self.focus == Focus::Outputs => self
+                .selected_output()
+                .map_or(Action::None, Action::SetDefault),
+            _ => Action::None,
+        }
+    }
+
+    fn move_selection(&mut self, down: bool) {
+        let (selected, len) = match self.focus {
+            Focus::Apps => (&mut self.stream_selected, self.graph.app_streams().len()),
+            Focus::Outputs => (&mut self.output_selected, Channel::ALL.len()),
+        };
+        if len == 0 {
+            *selected = 0;
+        } else if down {
+            *selected = (*selected + 1).min(len - 1);
+        } else {
+            *selected = selected.saturating_sub(1);
+        }
+    }
+
+    /// Digits route the selected application to the output with that number.
+    fn route_to_digit(&mut self, digit: char) -> Action {
+        let channel = digit
+            .to_digit(10)
+            .and_then(|n| usize::try_from(n).ok())
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|index| Channel::ALL.get(index).copied());
+        match (self.selected_stream_id(), channel) {
+            (Some(stream_id), Some(channel)) => Action::Route { stream_id, channel },
+            (None, _) => {
+                self.message = Some((Level::Info, "No application is playing audio.".to_owned()));
+                Action::None
+            }
+            (_, None) => Action::None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, App, Focus};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use rcp2_audio::{Channel, Graph};
+
+    const DUMP: &str = include_str!("../../../rcp2-audio/tests/fixtures/pw-dump.json");
+
+    fn app() -> App {
+        App::new(Graph::from_pw_dump(DUMP).unwrap())
+    }
+
+    fn press(app: &mut App, code: KeyCode) -> Action {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn digits_route_the_selected_app() {
+        let mut app = app();
+        // The fixture lists Firefox (300), spotify (301), qbz (303).
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('4')),
+            Action::Route {
+                stream_id: 301,
+                channel: Channel::Music
+            }
+        );
+        assert_eq!(press(&mut app, KeyCode::Char('7')), Action::None);
+    }
+
+    #[test]
+    fn selection_stays_in_bounds() {
+        let mut app = app();
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.stream_selected, 0);
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.stream_selected, 2);
+    }
+
+    #[test]
+    fn default_output_is_set_from_the_outputs_panel_only() {
+        let mut app = app();
+        assert_eq!(press(&mut app, KeyCode::Enter), Action::None);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, Focus::Outputs);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Action::SetDefault(Channel::Usb1)
+        );
+    }
+
+    #[test]
+    fn help_swallows_the_next_key() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.show_help);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::None);
+        assert!(!app.show_help);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::Quit);
+    }
+
+    #[test]
+    fn selection_follows_the_stream_across_refreshes() {
+        let mut app = app();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_stream_id(), Some(303));
+        // Firefox disappears: qbz must stay selected.
+        let mut objects: Vec<serde_json::Value> = serde_json::from_str(DUMP).unwrap();
+        objects.retain(|object| object["id"] != 300);
+        let graph = Graph::from_pw_dump(&serde_json::to_string(&objects).unwrap()).unwrap();
+        app.set_graph(graph);
+        assert_eq!(app.selected_stream_id(), Some(303));
+    }
+}

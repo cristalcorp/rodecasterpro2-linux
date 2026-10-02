@@ -109,3 +109,13 @@ pub fn move_stream(stream_id: u32, target_serial: u64) -> Result<(), PwError> {
     )
     .map(drop)
 }
+
+/// Makes the node `node_id` the default sink, remembered by WirePlumber
+/// across restarts (`wpctl set-default`).
+///
+/// # Errors
+///
+/// Returns [`PwError`] if `wpctl` cannot run or fails.
+pub fn set_default_sink(node_id: u32) -> Result<(), PwError> {
+    run("wpctl", &["set-default", &node_id.to_string()]).map(drop)
+}
