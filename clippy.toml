@@ -1,0 +1,8 @@
+# Tests may use unwrap/expect: a failure there is intended and readable.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+# Product names, not code identifiers ("..": keep clippy defaults).
+doc-valid-idents = ["RØDECaster", "PipeWire", ".."]

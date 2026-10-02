@@ -1,0 +1,36 @@
+# cargo-deny: vulnerabilities (RustSec), licenses, duplicates, crate sources.
+[graph]
+all-features = true
+
+[advisories]
+# Any known vulnerability or unmaintained crate fails CI.
+yanked = "deny"
+unmaintained = "all"
+
+[licenses]
+# Permissive licenses only; a new license is a decision, never a silent addition.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal path dependencies between unpublished workspace crates are fine.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
