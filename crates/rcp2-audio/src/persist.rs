@@ -133,7 +133,12 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, PwError> {
     }
 }
 
-fn remove_optional(path: &Path) -> Result<(), PwError> {
+/// Removes the file at `path` if there is one.
+///
+/// # Errors
+///
+/// Returns [`PwError::Io`] (naming the path) if it exists but cannot be removed.
+pub fn remove_file_if_present(path: &Path) -> Result<(), PwError> {
     match fs::remove_file(path) {
         Err(err) if err.kind() != io::ErrorKind::NotFound => Err(io_err(path)(err)),
         _ => Ok(()),
@@ -206,15 +211,24 @@ pub fn persist_state(paths: &PersistPaths) -> Result<PersistState, PwError> {
     })
 }
 
-/// What was at the config path before persistence was first turned on.
+/// What was at the config path before persistence was first turned on. The
+/// snapshot file carries the original's permissions.
 enum Original {
     Absent,
-    Content(Vec<u8>),
+    Content {
+        contents: Vec<u8>,
+        permissions: Option<fs::Permissions>,
+    },
 }
 
 fn read_snapshot(paths: &PersistPaths) -> Result<Option<Original>, PwError> {
-    if let Some(contents) = read_optional(&paths.snapshot_file())? {
-        return Ok(Some(Original::Content(contents)));
+    let file = paths.snapshot_file();
+    if let Some(contents) = read_optional(&file)? {
+        let permissions = fs::metadata(&file).ok().map(|meta| meta.permissions());
+        return Ok(Some(Original::Content {
+            contents,
+            permissions,
+        }));
     }
     if read_optional(&paths.absent_marker())?.is_some() {
         return Ok(Some(Original::Absent));
@@ -225,13 +239,52 @@ fn read_snapshot(paths: &PersistPaths) -> Result<Option<Original>, PwError> {
 fn write_snapshot(paths: &PersistPaths, original: &Original) -> Result<(), PwError> {
     match original {
         Original::Absent => write_atomically(&paths.absent_marker(), b""),
-        Original::Content(contents) => write_atomically(&paths.snapshot_file(), contents),
+        Original::Content {
+            contents,
+            permissions,
+        } => write_with_permissions(&paths.snapshot_file(), contents, permissions.as_ref()),
     }
 }
 
+fn write_with_permissions(
+    path: &Path,
+    contents: &[u8],
+    permissions: Option<&fs::Permissions>,
+) -> Result<(), PwError> {
+    write_atomically(path, contents)?;
+    if let Some(permissions) = permissions {
+        fs::set_permissions(path, permissions.clone()).map_err(io_err(path))?;
+    }
+    Ok(())
+}
+
+/// Puts the original back at the config path; `false` if it was "no file".
+fn restore_original(paths: &PersistPaths, original: &Original) -> Result<bool, PwError> {
+    match original {
+        Original::Content {
+            contents,
+            permissions,
+        } => {
+            write_with_permissions(&paths.config_file, contents, permissions.as_ref())?;
+            Ok(true)
+        }
+        Original::Absent => Ok(false),
+    }
+}
+
+/// Whether a record of the original state exists (persistence was turned on
+/// and not cleanly turned off since).
+///
+/// # Errors
+///
+/// Returns [`PwError::Io`] if the record cannot be read.
+pub fn original_recorded(paths: &PersistPaths) -> Result<bool, PwError> {
+    Ok(read_snapshot(paths)?.is_some())
+}
+
 fn clear_snapshot(paths: &PersistPaths) -> Result<(), PwError> {
-    remove_optional(&paths.snapshot_file())?;
-    remove_optional(&paths.absent_marker())?;
+    remove_file_if_present(&paths.snapshot_file())?;
+    remove_file_if_present(&paths.absent_marker())?;
     // Only removes the directory if empty: never anything we did not create.
     let _ = fs::remove_dir(&paths.snapshot_dir);
     Ok(())
@@ -270,7 +323,12 @@ pub fn enable_persistence(paths: &PersistPaths, contents: &str) -> Result<Enable
         Some(_) => {}
         None => {
             let original = match current.clone() {
-                Some(previous) if !is_ours(&previous) => Original::Content(previous),
+                Some(contents) if !is_ours(&contents) => Original::Content {
+                    contents,
+                    permissions: fs::metadata(&paths.config_file)
+                        .ok()
+                        .map(|meta| meta.permissions()),
+                },
                 _ => Original::Absent,
             };
             write_snapshot(paths, &original)?;
@@ -310,20 +368,22 @@ pub fn disable_persistence(paths: &PersistPaths) -> Result<DisableOutcome, PwErr
     refuse_symlink(&paths.config_file)?;
     match read_optional(&paths.config_file)? {
         None => {
+            // Our file was removed by hand: still put a recorded original back.
+            let outcome = match read_snapshot(paths)? {
+                Some(original) if restore_original(paths, &original)? => DisableOutcome::Restored,
+                _ => DisableOutcome::AlreadyOff,
+            };
             clear_snapshot(paths)?;
-            Ok(DisableOutcome::AlreadyOff)
+            Ok(outcome)
         }
         Some(current) if !is_ours(&current) => {
             Err(PwError::ModifiedOutside(paths.config_file.clone()))
         }
         Some(_) => {
             let outcome = match read_snapshot(paths)? {
-                Some(Original::Content(original)) => {
-                    write_atomically(&paths.config_file, &original)?;
-                    DisableOutcome::Restored
-                }
-                Some(Original::Absent) | None => {
-                    remove_optional(&paths.config_file)?;
+                Some(original) if restore_original(paths, &original)? => DisableOutcome::Restored,
+                _ => {
+                    remove_file_if_present(&paths.config_file)?;
                     DisableOutcome::Removed
                 }
             };
@@ -337,7 +397,7 @@ pub fn disable_persistence(paths: &PersistPaths) -> Result<DisableOutcome, PwErr
 mod tests {
     use super::{
         DisableOutcome, EnableOutcome, PersistPaths, PersistState, disable_persistence,
-        enable_persistence, persist_state, write_atomically,
+        enable_persistence, original_recorded, persist_state, write_atomically,
     };
     use crate::pw::PwError;
     use std::fs;
@@ -405,6 +465,42 @@ mod tests {
 
         assert_eq!(fs::read(&paths.config_file).unwrap(), original);
         assert!(!paths.snapshot_dir.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn restores_the_original_even_if_our_file_was_deleted_by_hand() {
+        let (dir, paths) = paths("deleted");
+        write_atomically(&paths.config_file, b"mine").unwrap();
+        enable_persistence(&paths, OURS).unwrap();
+        fs::remove_file(&paths.config_file).unwrap();
+
+        assert_eq!(persist_state(&paths).unwrap(), PersistState::Off);
+        assert!(original_recorded(&paths).unwrap());
+        assert_eq!(
+            disable_persistence(&paths).unwrap(),
+            DisableOutcome::Restored
+        );
+        assert_eq!(fs::read(&paths.config_file).unwrap(), b"mine");
+        assert!(!original_recorded(&paths).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn restores_the_original_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, paths) = paths("mode");
+        write_atomically(&paths.config_file, b"private").unwrap();
+        fs::set_permissions(&paths.config_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        enable_persistence(&paths, OURS).unwrap();
+        disable_persistence(&paths).unwrap();
+
+        let mode = fs::metadata(&paths.config_file)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
         fs::remove_dir_all(&dir).unwrap();
     }
 

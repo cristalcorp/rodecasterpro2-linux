@@ -46,7 +46,7 @@ pub enum PwError {
     )]
     Symlink(PathBuf),
     /// Neither `XDG_CONFIG_HOME` nor `HOME` is usable.
-    #[error("cannot locate the config directory: neither XDG_CONFIG_HOME nor HOME is set")]
+    #[error("cannot locate the home directory: set HOME (or the XDG base directory variables)")]
     NoConfigDir,
     /// Reading or writing the configuration file failed.
     #[error("{path}: {source}")]

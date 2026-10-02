@@ -5,13 +5,14 @@ mod settings;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use rcp2_audio::{
     APP_DIR, Channel, DetectError, DisableOutcome, EnableOutcome, Graph, PersistPaths,
     PersistState, PwError, UnsafeNodeName, create_runtime_outputs, data_home, disable_persistence,
-    enable_persistence, move_stream, persist_state, pipewire_config, remove_runtime_outputs,
-    snapshot,
+    enable_persistence, move_stream, original_recorded, persist_state, pipewire_config,
+    remove_file_if_present, remove_runtime_outputs, snapshot,
 };
 use settings::{Settings, SettingsError};
 
@@ -122,41 +123,65 @@ fn main() -> ExitCode {
 
 fn run(command: Command, out: &mut impl Write) -> Result<(), CliError> {
     let settings_path = settings::settings_path()?;
-    let mut settings = settings::load(&settings_path)?;
+    // Commands that must work even with unreadable settings do not load them.
     match command {
-        Command::Config => config(&snapshot()?, out),
+        Command::Config => return config(&snapshot()?, out),
         Command::Uninstall {
             yes,
             keep_pipewire_config,
-        } => uninstall(&settings_path, yes, keep_pipewire_config, out),
-        Command::Outputs { state } => {
-            settings.outputs = state == Switch::On;
-            if state == Switch::Off
-                && persist_state(&PersistPaths::from_env()?)? == PersistState::On
-            {
-                return Err(CliError::PersistentOutputs);
-            }
-            settings::save(&settings_path, &settings)?;
-            if state == Switch::On {
-                prepare(&settings)?;
-                writeln!(out, "Named outputs on (created at each launch).")?;
-            } else {
-                let removed = remove_runtime_outputs()?;
-                writeln!(
-                    out,
-                    "Named outputs off ({} removed). Apps that played on them move to the \
-                     default output.",
-                    removed.len()
-                )?;
-            }
-            Ok(())
-        }
+        } => return uninstall(&settings_path, yes, keep_pipewire_config, out),
+        _ => {}
+    }
+    let mut settings = settings::load(&settings_path)?;
+    match command {
+        Command::Config | Command::Uninstall { .. } => Ok(()),
+        Command::Outputs { state } => outputs(&settings_path, &mut settings, state, out),
         Command::Status => status(&prepare(&settings)?, &settings, out),
         Command::Apps => apps(&prepare(&settings)?, out),
         Command::Route { app, channel } => route(&prepare(&settings)?, &app, channel, out),
-        Command::Persist { state } => persist(&prepare(&settings)?, state, out),
+        Command::Persist { state } => persist(&prepare(&settings)?, &settings, state, out),
     }
 }
+
+fn outputs(
+    settings_path: &Path,
+    settings: &mut Settings,
+    state: Switch,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    if state == Switch::Off && persist_state(&PersistPaths::from_env()?)? == PersistState::On {
+        return Err(CliError::PersistentOutputs);
+    }
+    settings.outputs = state == Switch::On;
+    settings::save(settings_path, settings)?;
+    if state == Switch::On {
+        prepare(settings)?;
+        writeln!(out, "Named outputs on (created at each launch).")?;
+        return Ok(());
+    }
+    let removed = remove_runtime_outputs()?;
+    writeln!(
+        out,
+        "Named outputs off ({} removed). Apps that played on them move to the default output.",
+        removed.len()
+    )?;
+    let graph = snapshot()?;
+    if Channel::ALL
+        .into_iter()
+        .any(|channel| graph.virtual_sink(channel).is_some())
+    {
+        writeln!(
+            out,
+            "Some named outputs come from a PipeWire config file loaded at startup: they \
+             stay until PipeWire restarts."
+        )?;
+    }
+    Ok(())
+}
+
+/// How long to wait for outputs created through `pactl` to show up in the graph.
+const APPEAR_ATTEMPTS: u32 = 20;
+const APPEAR_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Restores the application's state at launch: creates the named outputs that
 /// are missing if they are on. Returns an up-to-date graph. Notices go to
@@ -180,7 +205,19 @@ fn prepare(settings: &Settings) -> Result<Graph, CliError> {
         "rcp2ctl: created named outputs: {}",
         names.join(", ")
     );
-    Ok(snapshot()?)
+    // pactl returns before the new nodes are visible to other clients.
+    let mut graph = snapshot()?;
+    for _ in 0..APPEAR_ATTEMPTS {
+        if created
+            .iter()
+            .all(|channel| graph.virtual_sink(*channel).is_some())
+        {
+            break;
+        }
+        std::thread::sleep(APPEAR_INTERVAL);
+        graph = snapshot()?;
+    }
+    Ok(graph)
 }
 
 fn status(graph: &Graph, settings: &Settings, out: &mut impl Write) -> Result<(), CliError> {
@@ -189,7 +226,8 @@ fn status(graph: &Graph, settings: &Settings, out: &mut impl Write) -> Result<()
     writeln!(out, "  native stereo sink: {}", rode.stereo_sink)?;
     writeln!(out, "  native multi sink:  {}", rode.multi_sink)?;
     let paths = PersistPaths::from_env()?;
-    let mode = match (persist_state(&paths)?, settings.outputs) {
+    let persisted = persist_state(&paths)?;
+    let mode = match (persisted, settings.outputs) {
         (PersistState::On, _) => {
             "on, kept by the PipeWire config file (`rcp2ctl persist off` to undo)"
         }
@@ -210,7 +248,7 @@ fn status(graph: &Graph, settings: &Settings, out: &mut impl Write) -> Result<()
             channel.sink_name()
         )?;
     }
-    if persist_state(&paths)? == PersistState::Foreign {
+    if persisted == PersistState::Foreign {
         writeln!(
             out,
             "Note: {} exists but was not written by rcp2ctl; persistence will not touch it.",
@@ -225,9 +263,19 @@ fn config(graph: &Graph, out: &mut impl Write) -> Result<(), CliError> {
     Ok(())
 }
 
-fn persist(graph: &Graph, state: Switch, out: &mut impl Write) -> Result<(), CliError> {
+fn persist(
+    graph: &Graph,
+    settings: &Settings,
+    state: Switch,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
     let paths = PersistPaths::from_env()?;
     let file = paths.config_file.display();
+    let after_restart = if settings.outputs {
+        "rcp2ctl recreates them at each launch"
+    } else {
+        "named outputs are off, so rcp2ctl will not recreate them (`rcp2ctl outputs on`)"
+    };
     match state {
         Switch::On => {
             let contents = pipewire_config(&graph.rode()?)?;
@@ -244,14 +292,15 @@ fn persist(graph: &Graph, state: Switch, out: &mut impl Write) -> Result<(), Cli
         }
         Switch::Off => match disable_persistence(&paths)? {
             DisableOutcome::AlreadyOff => writeln!(out, "Persistence already off.")?,
-            DisableOutcome::Restored => {
-                writeln!(out, "Persistence off: original {file} restored.")?;
-            }
+            DisableOutcome::Restored => writeln!(
+                out,
+                "Persistence off: original {file} restored. After the next PipeWire \
+                 restart, {after_restart}."
+            )?,
             DisableOutcome::Removed => writeln!(
                 out,
                 "Persistence off: removed {file} (there was none originally). The current \
-                 outputs keep working until PipeWire restarts; rcp2ctl recreates them at \
-                 launch."
+                 outputs keep working until PipeWire restarts; then {after_restart}."
             )?,
         },
     }
@@ -293,13 +342,30 @@ fn uninstall(
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let paths = PersistPaths::from_env()?;
-    if persist_state(&paths)? == PersistState::On {
+    // Also when our file was edited or deleted by hand: a recorded original
+    // must not be left behind silently.
+    let concerned = persist_state(&paths)? == PersistState::On || original_recorded(&paths)?;
+    if concerned {
         let restore = yes
             || (!keep_pipewire_config
                 && ask("Restore the original PipeWire configuration?", true, out)?);
         if restore {
-            disable_persistence(&paths)?;
-            writeln!(out, "Original PipeWire configuration restored.")?;
+            match disable_persistence(&paths) {
+                Ok(DisableOutcome::Restored) => {
+                    writeln!(out, "Original PipeWire configuration restored.")?;
+                }
+                Ok(DisableOutcome::Removed | DisableOutcome::AlreadyOff) => writeln!(
+                    out,
+                    "PipeWire configuration back to its original state (no file)."
+                )?,
+                Err(PwError::ModifiedOutside(path)) => writeln!(
+                    out,
+                    "{} was changed by hand: left untouched. The original is kept in {}.",
+                    path.display(),
+                    paths.snapshot_dir.display()
+                )?,
+                Err(err) => return Err(err.into()),
+            }
         } else {
             writeln!(
                 out,
@@ -310,20 +376,27 @@ fn uninstall(
             )?;
         }
     }
-    let removed = remove_runtime_outputs()?;
-    writeln!(
-        out,
-        "Removed {} named output(s) created at runtime.",
-        removed.len()
-    )?;
+    // Keep going if PipeWire is unreachable: the rest of the cleanup still applies.
+    let runtime = remove_runtime_outputs();
+    match &runtime {
+        Ok(removed) => writeln!(
+            out,
+            "Removed {} named output(s) created at runtime.",
+            removed.len()
+        )?,
+        Err(err) => writeln!(
+            out,
+            "Could not remove the runtime named outputs ({err}); they vanish at the next \
+             PipeWire restart anyway."
+        )?,
+    }
 
     // Only what rcp2ctl created: never a recursive delete of a shared directory.
-    remove_if_present(settings_path)?;
+    remove_file_if_present(settings_path)?;
     if let Some(dir) = settings_path.parent() {
         let _ = std::fs::remove_dir(dir);
     }
-    // Non-recursive: a kept snapshot (restoration declined) or anything else
-    // in our data directory stays.
+    // Non-recursive: a kept record of the original stays.
     let _ = std::fs::remove_dir(data_home()?.join(APP_DIR));
     writeln!(out, "rcp2ctl settings removed.")?;
     match std::env::current_exe() {
@@ -335,13 +408,6 @@ fn uninstall(
         Err(_) => writeln!(out, "Last step: remove the rcp2ctl binary itself.")?,
     }
     Ok(())
-}
-
-fn remove_if_present(path: &Path) -> Result<(), CliError> {
-    match std::fs::remove_file(path) {
-        Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err.into()),
-        _ => Ok(()),
-    }
 }
 
 /// Name to show for a node an application plays to: our label for our own
