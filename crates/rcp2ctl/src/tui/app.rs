@@ -44,7 +44,12 @@ pub(crate) struct App {
     pub(crate) output_selected: usize,
     pub(crate) message: Option<(Level, String)>,
     pub(crate) show_help: bool,
+    /// The board's own state from the board service, or why it is missing.
+    pub(crate) board: Option<BoardView>,
 }
+
+/// What the board service said: its state, or why it could not be asked.
+pub(crate) type BoardView = Result<crate::daemon::StateDto, String>;
 
 impl App {
     pub(crate) fn new(graph: Graph) -> Self {
@@ -55,6 +60,7 @@ impl App {
             output_selected: 0,
             message: None,
             show_help: false,
+            board: None,
         }
     }
 

@@ -10,6 +10,7 @@ use ratatui::widgets::{
 use rcp2_audio::{Channel, PersistState};
 
 use super::app::{App, Focus, Level};
+use crate::daemon::{ChannelDto, StateDto};
 use crate::{channel_of, output_label};
 
 /// Golden yellow accent.
@@ -24,9 +25,10 @@ pub(crate) struct Mode {
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
-    let [header, body, message, keys] = Layout::vertical([
+    let [header, body, console, message, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(8),
+        Constraint::Length(console_height(app)),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -37,6 +39,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
     frame.render_widget(header_line(app, mode), header);
     render_outputs(frame, app, outputs);
     render_apps(frame, app, apps);
+    render_console(frame, app, console);
     frame.render_widget(message_line(app), message);
     frame.render_widget(keys_line(app), keys);
     if app.show_help {
@@ -123,6 +126,12 @@ fn render_outputs(frame: &mut Frame<'_>, app: &App, area: Rect) {
             if default == Some(channel) {
                 spans.push(Span::styled(" ★", Style::new().fg(ACCENT)));
             }
+            if let Some(fader) = fader_of(app, channel) {
+                spans.push(Span::styled(
+                    format!(" F{fader}"),
+                    Style::new().fg(Color::DarkGray),
+                ));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -132,6 +141,112 @@ fn render_outputs(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style(focused));
     let mut state = ListState::default().with_selected(Some(app.output_selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// The board's name for the source feeding a named output, when known.
+const fn source_label(channel: Channel) -> Option<&'static str> {
+    match channel {
+        Channel::Chat => Some("Chat"),
+        Channel::Usb1 => Some("USB 1"),
+        Channel::Game => Some("Game"),
+        Channel::Music => Some("Music"),
+        Channel::A | Channel::B => None,
+    }
+}
+
+/// The board's channel strips worth showing, with their fader number
+/// (strip `n` sits on fader `n + 1`, verified on hardware; strips beyond the
+/// last fader have none).
+fn strips(state: &StateDto) -> Vec<(Option<usize>, &ChannelDto)> {
+    state
+        .channels
+        .iter()
+        .enumerate()
+        .filter(|(_, channel)| channel.source != "(empty)")
+        .map(|(position, channel)| {
+            (
+                (position < state.faders.len()).then_some(position + 1),
+                channel,
+            )
+        })
+        .collect()
+}
+
+fn known_state(app: &App) -> Option<&StateDto> {
+    match &app.board {
+        Some(Ok(state)) if state.connected && state.state_known => Some(state),
+        _ => None,
+    }
+}
+
+/// The fader carrying a named output's channel on the board, if known.
+fn fader_of(app: &App, channel: Channel) -> Option<usize> {
+    let label = source_label(channel)?;
+    strips(known_state(app)?)
+        .into_iter()
+        .find(|(_, strip)| strip.source == label)
+        .and_then(|(fader, _)| fader)
+}
+
+fn console_height(app: &App) -> u16 {
+    // Borders plus header row plus one row per strip; one line otherwise.
+    known_state(app).map_or(3, |state| {
+        u16::try_from(strips(state).len()).map_or(3, |rows| rows.saturating_add(3))
+    })
+}
+
+fn render_console(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let block = panel(" Console ", false);
+    let Some(state) = known_state(app) else {
+        let text = match &app.board {
+            Some(Ok(state)) if state.connected => "Reading the board's state…",
+            Some(Ok(_)) => "Board service running; the board is not connected.",
+            Some(Err(_)) | None => "Board service not running: `rcp2ctl hid setup` installs it.",
+        };
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(Style::new().fg(Color::DarkGray))
+                .block(block),
+            area,
+        );
+        return;
+    };
+    let rows = strips(state).into_iter().map(|(fader, strip)| {
+        let (output, style) = match strip.muted {
+            Some(true) => ("muted", Style::new().fg(Color::Red)),
+            Some(false) => ("on", Style::new().fg(Color::Green)),
+            None => ("?", Style::new()),
+        };
+        let level = fader
+            .and_then(|fader| state.faders.get(fader - 1))
+            .map_or_else(String::new, |level| fader_bar(*level));
+        Row::new(vec![
+            Cell::from(fader.map_or_else(|| "-".to_owned(), |fader| format!("F{fader}"))),
+            Cell::from(strip.source.clone()),
+            Cell::from(output).style(style),
+            Cell::from(level),
+        ])
+    });
+    let header = Row::new(["FADER", "SOURCE", "OUTPUT", "LEVEL (last full read)"])
+        .style(Style::new().add_modifier(Modifier::BOLD));
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(6),
+            Constraint::Length(12),
+            Constraint::Length(7),
+            Constraint::Min(20),
+        ],
+    )
+    .header(header)
+    .block(block);
+    frame.render_widget(table, area);
+}
+
+/// A 0–127 fader level as a 12-cell bar and its value.
+fn fader_bar(level: i32) -> String {
+    let filled = usize::try_from(level.clamp(0, 127) * 12 / 127).unwrap_or(0);
+    format!("{}{} {level}", "█".repeat(filled), "·".repeat(12 - filled))
 }
 
 fn render_apps(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -232,7 +347,7 @@ fn render_help(frame: &mut Frame<'_>) {
         .collect();
     lines.push(Line::raw(""));
     lines.push(Line::raw(
-        "★ default output   ♪ applications playing   any key closes",
+        "★ default  ♪ apps playing  Fn fader on the board  any key closes",
     ));
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(panel(" Help ", true)), area);
@@ -260,7 +375,7 @@ mod tests {
     const DUMP: &str = include_str!("../../../rcp2-audio/tests/fixtures/pw-dump.json");
 
     fn screen(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let mode = Mode {
             outputs_on: true,
             persist: Some(PersistState::Off),
@@ -294,6 +409,50 @@ mod tests {
         assert!(screen.contains("4 RØDE Music  absent"), "{screen}");
         assert!(screen.contains("qbz"), "{screen}");
         assert!(screen.contains("PipeWire ALSA [qbz]"), "{screen}");
+    }
+
+    #[test]
+    fn shows_the_board_and_the_fader_of_each_output() {
+        use crate::daemon::{ChannelDto, StateDto};
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        let strip = |index, source: &str, muted| ChannelDto {
+            index,
+            source: source.to_owned(),
+            muted: Some(muted),
+        };
+        app.board = Some(Ok(StateDto {
+            version: 1,
+            connected: true,
+            state_known: true,
+            firmware: Some("1.7.6".to_owned()),
+            channels: vec![
+                strip(0x1A, "Mic 1", true),
+                strip(0x1B, "USB 1", false),
+                strip(0x1C, "Chat", false),
+                strip(0x1D, "Music", false),
+                strip(0x1E, "Game", false),
+                strip(0x1F, "(empty)", false),
+                strip(0x103, "source 9", false),
+            ],
+            faders: vec![45, 26, 28, 22, 127, 0],
+            notifications: 3,
+        }));
+        let screen = screen(&app);
+        assert!(screen.contains("3 RØDE Game   ♪1 ★ F5"), "{screen}");
+        assert!(screen.contains("F1"), "{screen}");
+        assert!(screen.contains("Mic 1"), "{screen}");
+        assert!(screen.contains("muted"), "{screen}");
+        assert!(screen.contains("████████████ 127"), "{screen}");
+        // Empty strips are hidden; a strip past the last fader has none.
+        assert!(!screen.contains("(empty)"), "{screen}");
+        assert!(screen.contains("source 9"), "{screen}");
+    }
+
+    #[test]
+    fn says_how_to_start_the_service_when_it_is_not_running() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.board = Some(Err("not running".to_owned()));
+        assert!(screen(&app).contains("rcp2ctl hid setup"));
     }
 
     #[test]

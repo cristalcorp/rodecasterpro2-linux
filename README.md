@@ -182,7 +182,15 @@ The screen has a header (board, how the outputs are kept, default output), an
 
 - ★ marks the system's default output.
 - ♪ *n* shows how many applications play on an output.
+- F*n* shows which fader of the board carries that output (needs the board
+  service, see below).
 - "absent" means the named output does not exist right now.
+
+When the board service runs (`rcp2ctl hid setup`), a **Console** panel at the
+bottom shows the board's channel strips: fader, source, whether the output is
+muted (updated live) and the fader level. Fader levels are as of the last full
+read of the board: the board sends no update when a fader moves. Without the
+service, the panel says how to start it; everything else works the same.
 
 | Key | Action |
 |---|---|
@@ -462,7 +470,7 @@ opens the TUI; in scripts, use the commands from the reference.
 | Terminal interface | Done (audio side) |
 | Reading the board's state | Done: exact decoder, board service, `rcp2ctl board` |
 | Fix for the fader freeze | Done while the board service runs |
-| Board state in the TUI | Next |
+| Board state in the TUI | Done: Console panel, fader of each output |
 | Live fader levels in the TUI | Planned (faders send no live notification; MIDI is being evaluated) |
 | Writing board settings (mutes, gain, processing) | Later, one setting type at a time, each tested on hardware first |
 

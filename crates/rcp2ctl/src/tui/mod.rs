@@ -12,7 +12,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event};
 use rcp2_audio::{Graph, PersistPaths, PwError, persist_state, snapshot};
 
-use self::app::{Action, App, Level};
+use self::app::{Action, App, BoardView, Level};
 use self::view::Mode;
 use crate::settings::{self, Settings};
 use crate::{CliError, Switch, outputs, persist, prepare, route, set_default};
@@ -22,14 +22,21 @@ const REFRESH_EVERY: Duration = Duration::from_secs(1);
 /// How long to wait for a key before handling background refreshes.
 const INPUT_POLL: Duration = Duration::from_millis(100);
 
-/// A graph snapshot and when it was started: older ones are ignored.
-type Snapshot = (Instant, Result<Graph, PwError>);
+/// A graph snapshot and when it was started (older ones are ignored), with
+/// the board service's view of the board.
+type Snapshot = (Instant, Result<Graph, PwError>, BoardView);
+
+/// Asks the board service for the board state (fast: a local socket).
+fn board_view() -> BoardView {
+    crate::daemon::query_state().map_err(|err| err.to_string())
+}
 
 pub(crate) fn run() -> Result<(), CliError> {
     let settings_path = settings::settings_path()?;
     let mut settings = settings::load(&settings_path)?;
     // Before the alternate screen, so its notice is visible after quitting.
     let mut app = App::new(prepare(&settings)?);
+    app.board = Some(board_view());
     let (requests, snapshots) = spawn_refresher();
 
     let mut terminal = ratatui::try_init()?;
@@ -53,7 +60,10 @@ fn spawn_refresher() -> (Sender<()>, Receiver<Snapshot>) {
     thread::spawn(move || {
         while let Ok(()) | Err(RecvTimeoutError::Timeout) = requests.recv_timeout(REFRESH_EVERY) {
             let started = Instant::now();
-            if snapshot_sender.send((started, snapshot())).is_err() {
+            if snapshot_sender
+                .send((started, snapshot(), board_view()))
+                .is_err()
+            {
                 break;
             }
         }
@@ -91,7 +101,9 @@ fn event_loop(
     loop {
         terminal.draw(|frame| view::render(frame, app, mode))?;
 
-        while let Ok((started, refresh)) = snapshots.try_recv() {
+        while let Ok((started, refresh, board)) = snapshots.try_recv() {
+            // Actions never change the board: its view is always fresh enough.
+            app.board = Some(board);
             if started < fresh_after {
                 continue;
             }
