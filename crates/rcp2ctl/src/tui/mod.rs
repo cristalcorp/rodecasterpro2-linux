@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event};
-use rcp2_audio::{Graph, PersistPaths, PersistState, PwError, persist_state, snapshot};
+use rcp2_audio::{Graph, PersistPaths, PwError, persist_state, snapshot};
 
 use self::app::{Action, App, Level};
 use self::view::Mode;
@@ -119,7 +119,7 @@ fn event_loop(
             Action::Quit => return Ok(()),
             Action::None => {}
             action => {
-                perform(&action, app, settings, settings_path, mode);
+                perform(&action, app, settings, settings_path);
                 refresh_error_shown = false;
                 let (new_mode, error) = current_mode(settings);
                 mode = new_mode;
@@ -137,7 +137,7 @@ fn event_loop(
 
 /// Runs an action through the same code as the CLI, and shows its output (or
 /// error) on the message line.
-fn perform(action: &Action, app: &mut App, settings: &mut Settings, path: &Path, mode: Mode) {
+fn perform(action: &Action, app: &mut App, settings: &mut Settings, path: &Path) {
     let mut text = Vec::new();
     let mut notices = Vec::new();
     let result = match *action {
@@ -155,17 +155,8 @@ fn perform(action: &Action, app: &mut App, settings: &mut Settings, path: &Path,
                 notices.push(notice.to_owned());
             })
         }
-        Action::TogglePersist => match mode.persist {
-            None => Err(CliError::PersistStateUnknown),
-            Some(current) => {
-                let state = if current == PersistState::On {
-                    Switch::Off
-                } else {
-                    Switch::On
-                };
-                persist(&app.graph, settings, state, &mut text)
-            }
-        },
+        Action::EnablePersist => persist(&app.graph, settings, Switch::On, &mut text),
+        Action::RestoreOriginal => persist(&app.graph, settings, Switch::Off, &mut text),
         Action::Refresh | Action::None | Action::Quit => Ok(()),
     };
     app.message = match result {

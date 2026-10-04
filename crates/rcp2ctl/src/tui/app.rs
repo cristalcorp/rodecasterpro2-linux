@@ -24,7 +24,10 @@ pub(crate) enum Action {
     /// Make a named output the system's default output.
     SetDefault(Channel),
     ToggleOutputs,
-    TogglePersist,
+    /// Install the PipeWire config file keeping the outputs after a reboot.
+    EnablePersist,
+    /// Put back the original PipeWire configuration.
+    RestoreOriginal,
 }
 
 /// Severity of the message shown under the panels.
@@ -95,9 +98,12 @@ impl App {
                 self.show_help = true;
                 Action::None
             }
-            KeyCode::Char('r') => Action::Refresh,
+            KeyCode::F(5) => Action::Refresh,
+            // For terminals that keep F5 for themselves; the usual redraw key.
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Refresh,
+            KeyCode::Char('r') => Action::RestoreOriginal,
             KeyCode::Char('o') => Action::ToggleOutputs,
-            KeyCode::Char('p') => Action::TogglePersist,
+            KeyCode::Char('p') => Action::EnablePersist,
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
                 self.focus = match self.focus {
                     Focus::Apps => Focus::Outputs,
@@ -207,6 +213,19 @@ mod tests {
         assert_eq!(
             press(&mut app, KeyCode::Enter),
             Action::SetDefault(Channel::Usb1)
+        );
+    }
+
+    #[test]
+    fn persistence_has_one_key_per_direction() {
+        let mut app = app();
+        assert_eq!(press(&mut app, KeyCode::Char('p')), Action::EnablePersist);
+        assert_eq!(press(&mut app, KeyCode::Char('p')), Action::EnablePersist);
+        assert_eq!(press(&mut app, KeyCode::Char('r')), Action::RestoreOriginal);
+        assert_eq!(press(&mut app, KeyCode::F(5)), Action::Refresh);
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Action::Refresh
         );
     }
 
