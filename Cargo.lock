@@ -1177,6 +1177,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcp2-hid"
+version = "0.1.0"
+dependencies = [
+ "rcp2-proto",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "rcp2-proto"
 version = "0.1.0"
 
@@ -1187,6 +1195,7 @@ dependencies = [
  "clap",
  "ratatui",
  "rcp2-audio",
+ "rcp2-hid",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

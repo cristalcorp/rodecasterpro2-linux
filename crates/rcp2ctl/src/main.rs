@@ -4,7 +4,7 @@ mod settings;
 mod tui;
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -65,6 +65,11 @@ enum Command {
         /// Named output.
         channel: Channel,
     },
+    /// Board control interface (HID): read-only diagnostics.
+    Hid {
+        #[command(subcommand)]
+        command: HidCommand,
+    },
     /// Undo everything rcp2ctl did, before removing the binary.
     Uninstall {
         /// Restore the original PipeWire configuration without asking.
@@ -73,6 +78,21 @@ enum Command {
         /// Keep the PipeWire config file without asking.
         #[arg(long, conflicts_with = "yes")]
         keep_pipewire_config: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HidCommand {
+    /// Show which hidraw node is the board's control interface (opens nothing).
+    Find,
+    /// Handshake with the board and record what it sends (read-only), to study
+    /// the protocol. The file contains the board's serial number: keep it private.
+    Capture {
+        /// Output file, must end in `.rcp2cap` (ignored by git).
+        file: PathBuf,
+        /// Stop after this many seconds at most.
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
     },
 }
 
@@ -113,6 +133,12 @@ enum CliError {
     UninstallIncomplete(usize),
     #[error("the interactive interface needs a terminal; see `rcp2ctl --help` for commands")]
     NoTerminal,
+    #[error(transparent)]
+    Hid(#[from] rcp2_hid::HidError),
+    #[error(
+        "capture files must end in `.{CAPTURE_EXTENSION}` (git ignores them: they hold the serial number)"
+    )]
+    CaptureExtension,
     #[error("cannot write output: {0}")]
     Output(#[from] io::Error),
 }
@@ -163,6 +189,7 @@ fn run(command: Command, out: &mut impl Write) -> Result<(), CliError> {
         Command::Apps => apps(&prepare(&load_settings()?)?, out),
         Command::Route { app, channel } => route(&prepare(&load_settings()?)?, &app, channel, out),
         Command::Default { channel } => set_default(&prepare(&load_settings()?)?, channel, out),
+        Command::Hid { command } => hid(command, out),
         Command::Persist { state } => {
             let settings = load_settings()?;
             persist(&prepare(&settings)?, &settings, state, out)
@@ -642,6 +669,90 @@ fn set_default(graph: &Graph, channel: Channel, out: &mut impl Write) -> Result<
         "{} is now the default output (remembered by WirePlumber).",
         channel.description()
     )?;
+    Ok(())
+}
+
+/// Extension of capture files, ignored by git.
+const CAPTURE_EXTENSION: &str = "rcp2cap";
+/// A capture ends once the board stays quiet this long after the burst.
+const CAPTURE_IDLE: Duration = Duration::from_millis(500);
+
+fn hid(command: HidCommand, out: &mut impl Write) -> Result<(), CliError> {
+    use std::fmt::Write as _;
+    let sys_class = Path::new(rcp2_hid::SYS_CLASS_HIDRAW);
+    match command {
+        HidCommand::Find => {
+            for path in rcp2_hid::find_devices(sys_class)? {
+                writeln!(out, "{}", path.display())?;
+            }
+            Ok(())
+        }
+        HidCommand::Capture { file, seconds } => {
+            if file.extension().and_then(|ext| ext.to_str()) != Some(CAPTURE_EXTENSION) {
+                return Err(CliError::CaptureExtension);
+            }
+            // Create the file first: never handshake for nothing, never overwrite.
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&file)
+                .map_err(|source| PwError::Io {
+                    path: file.clone(),
+                    source,
+                })?;
+            let path = rcp2_hid::find_device(sys_class)?;
+            let mut board = rcp2_hid::Board::open(&path)?;
+            let reports =
+                rcp2_hid::capture(&mut board, Duration::from_secs(seconds), CAPTURE_IDLE)?;
+            let mut text = String::from("# rcp2 capture v1: <microseconds> <report hex>\n");
+            for report in &reports {
+                // Writing to a String cannot fail.
+                let _ = write!(text, "{} ", report.at.as_micros());
+                for byte in &report.bytes {
+                    let _ = write!(text, "{byte:02x}");
+                }
+                text.push('\n');
+            }
+            output
+                .write_all(text.as_bytes())
+                .map_err(|source| PwError::Io {
+                    path: file.clone(),
+                    source,
+                })?;
+            summarise_capture(&reports, &file, out)
+        }
+    }
+}
+
+/// Counts only: the content holds the serial number and stays in the file.
+fn summarise_capture(
+    reports: &[rcp2_hid::Report],
+    file: &Path,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let bytes: usize = reports.iter().map(|report| report.bytes.len()).sum();
+    writeln!(
+        out,
+        "Captured {} report(s), {bytes} bytes, into {}.",
+        reports.len(),
+        file.display()
+    )?;
+    let mut ids: Vec<(u8, usize)> = Vec::new();
+    for id in reports
+        .iter()
+        .filter_map(|report| report.bytes.first().copied())
+    {
+        match ids.iter_mut().find(|(known, _)| *known == id) {
+            Some((_, count)) => *count += 1,
+            None => ids.push((id, 1)),
+        }
+    }
+    for (id, count) in ids {
+        writeln!(out, "  report {id}: {count}")?;
+    }
+    if let Some(last) = reports.last() {
+        writeln!(out, "  last report after {} ms", last.at.as_millis())?;
+    }
     Ok(())
 }
 

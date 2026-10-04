@@ -1,0 +1,16 @@
+[package]
+name = "rcp2-hid"
+description = "hidraw transport for the RØDECaster Pro II control interface (Linux)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+rcp2-proto = { path = "../rcp2-proto" }
+thiserror = "2.0.21"
+
+[lints]
+workspace = true
