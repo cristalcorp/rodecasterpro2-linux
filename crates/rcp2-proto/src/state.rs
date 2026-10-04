@@ -14,6 +14,12 @@ pub enum InputSource {
     Usb1,
     /// Code `8`: Chat (verified).
     Chat,
+    /// Code `11`: SMART Pads (verified).
+    SmartPads,
+    /// Code `12`: Game, a virtual USB channel (verified).
+    Game,
+    /// Code `13`: Music, a virtual USB channel (verified).
+    Music,
     /// Code `-1`: nothing assigned.
     Empty,
     /// Any other code, not verified yet.
@@ -28,6 +34,9 @@ impl InputSource {
             0 => Self::Mic1,
             7 => Self::Usb1,
             8 => Self::Chat,
+            11 => Self::SmartPads,
+            12 => Self::Game,
+            13 => Self::Music,
             -1 => Self::Empty,
             other => Self::Code(other),
         }
@@ -40,6 +49,9 @@ impl std::fmt::Display for InputSource {
             Self::Mic1 => f.write_str("Mic 1"),
             Self::Usb1 => f.write_str("USB 1"),
             Self::Chat => f.write_str("Chat"),
+            Self::SmartPads => f.write_str("SMART Pads"),
+            Self::Game => f.write_str("Game"),
+            Self::Music => f.write_str("Music"),
             Self::Empty => f.write_str("(empty)"),
             Self::Code(code) => write!(f, "source {code}"),
         }
@@ -181,7 +193,7 @@ mod tests {
                 },
                 ChannelState {
                     index: 5,
-                    source: InputSource::Code(12),
+                    source: InputSource::Game,
                     muted: Some(false)
                 },
             ]

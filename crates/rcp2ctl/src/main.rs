@@ -4,6 +4,7 @@ mod settings;
 mod tui;
 
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -93,8 +94,8 @@ enum HidCommand {
     Capture {
         /// Output file, must end in `.rcp2cap` (ignored by git).
         file: PathBuf,
-        /// Stop after this many seconds at most.
-        #[arg(long, default_value_t = 10)]
+        /// Stop after this many seconds at most (1 to 60).
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=60))]
         seconds: u64,
         /// Do not ask for confirmation (the faders still freeze until a replug).
         #[arg(long)]
@@ -151,6 +152,10 @@ enum CliError {
         "capture files must end in `.{CAPTURE_EXTENSION}` (git ignores them: they hold the serial number)"
     )]
     CaptureExtension,
+    #[error("{path}: {source}")]
+    File { path: PathBuf, source: io::Error },
+    #[error("capture interrupted after {0} report(s), saved anyway: {1}")]
+    CaptureInterrupted(usize, rcp2_hid::HidError),
     #[error("{0}: not a valid capture file (line {1})")]
     BadCapture(PathBuf, usize),
     #[error("the capture holds no complete state dump ({0})")]
@@ -467,6 +472,36 @@ fn ask(question: &str, default: bool, out: &mut impl Write) -> Result<bool, CliE
     }
 }
 
+/// Removes the udev rule if `hid setup` installed it. Returns the problem to
+/// report, if any; only a terminal write error stops it.
+fn remove_udev_rule(out: &mut impl Write) -> Result<Option<String>, CliError> {
+    let state = match read_rule() {
+        Ok(text) => rcp2_hid::rule_state(text.as_deref()),
+        Err(err) => return Ok(Some(format!("could not check the udev rule: {err}"))),
+    };
+    if !matches!(
+        state,
+        rcp2_hid::RuleState::UpToDate | rcp2_hid::RuleState::Outdated
+    ) {
+        return Ok(None);
+    }
+    writeln!(
+        out,
+        "Removing {} (sudo may ask for your password).",
+        rcp2_hid::UDEV_RULE_PATH
+    )?;
+    match sudo(&["rm", "-f", rcp2_hid::UDEV_RULE_PATH]).and_then(|()| reload_udev()) {
+        Ok(()) => {
+            writeln!(
+                out,
+                "Board access rule removed (fully effective after the next replug or login)."
+            )?;
+            Ok(None)
+        }
+        Err(err) => Ok(Some(format!("could not remove the udev rule: {err}"))),
+    }
+}
+
 fn uninstall(yes: bool, keep_pipewire_config: bool, out: &mut impl Write) -> Result<(), CliError> {
     // Goes as far as possible: each failed step is reported and the rest still runs.
     let mut problems = 0;
@@ -520,19 +555,8 @@ fn uninstall(yes: bool, keep_pipewire_config: bool, out: &mut impl Write) -> Res
     }
 
     // The udev rule from `rcp2ctl hid setup`, only if it is ours.
-    if matches!(
-        rcp2_hid::rule_state(read_rule().as_deref()),
-        rcp2_hid::RuleState::UpToDate | rcp2_hid::RuleState::Outdated
-    ) {
-        writeln!(
-            out,
-            "Removing {} (sudo may ask for your password).",
-            rcp2_hid::UDEV_RULE_PATH
-        )?;
-        match sudo(&["rm", "-f", rcp2_hid::UDEV_RULE_PATH]).and_then(|()| reload_udev()) {
-            Ok(()) => writeln!(out, "Board access rule removed.")?,
-            Err(err) => warn(out, format!("could not remove the udev rule: {err}"))?,
-        }
+    if let Some(problem) = remove_udev_rule(out)? {
+        warn(out, problem)?;
     }
 
     match remove_runtime_outputs() {
@@ -746,16 +770,24 @@ fn hid(command: HidCommand, out: &mut impl Write) -> Result<(), CliError> {
                 .write(true)
                 .create_new(true)
                 .open(&file)
-                .map_err(|source| PwError::Io {
-                    path: file.clone(),
-                    source,
-                })?;
-            let path = rcp2_hid::find_device(sys_class)?;
-            let mut board = rcp2_hid::Board::open(&path)?;
-            let reports =
-                rcp2_hid::capture(&mut board, Duration::from_secs(seconds), CAPTURE_IDLE)?;
+                .map_err(file_err(&file))?;
+            let captured = rcp2_hid::find_device(sys_class)
+                .and_then(|path| rcp2_hid::Board::open(&path))
+                .and_then(|mut board| {
+                    rcp2_hid::capture(&mut board, Duration::from_secs(seconds), CAPTURE_IDLE)
+                });
+            let captured = match captured {
+                Ok(captured) => captured,
+                Err(err) => {
+                    // Nothing was recorded: do not leave an empty file behind.
+                    drop(output);
+                    let _ = std::fs::remove_file(&file);
+                    return Err(err.into());
+                }
+            };
+            let reports = &captured.reports;
             let mut text = String::from("# rcp2 capture v1: <microseconds> <report hex>\n");
-            for report in &reports {
+            for report in reports {
                 // Writing to a String cannot fail.
                 let _ = write!(text, "{} ", report.at.as_micros());
                 for byte in &report.bytes {
@@ -763,23 +795,19 @@ fn hid(command: HidCommand, out: &mut impl Write) -> Result<(), CliError> {
                 }
                 text.push('\n');
             }
-            output
-                .write_all(text.as_bytes())
-                .map_err(|source| PwError::Io {
-                    path: file.clone(),
-                    source,
-                })?;
-            summarise_capture(&reports, &file, out)
+            output.write_all(text.as_bytes()).map_err(file_err(&file))?;
+            summarise_capture(reports, &file, out)?;
+            match captured.error {
+                Some(err) => Err(CliError::CaptureInterrupted(reports.len(), err)),
+                None => Ok(()),
+            }
         }
     }
 }
 
 /// Reads the reports of a capture file (`<microseconds> <hex>` per line).
 fn read_capture(file: &Path) -> Result<Vec<Vec<u8>>, CliError> {
-    let text = std::fs::read_to_string(file).map_err(|source| PwError::Io {
-        path: file.to_owned(),
-        source,
-    })?;
+    let text = std::fs::read_to_string(file).map_err(file_err(file))?;
     let mut reports = Vec::new();
     for (number, line) in text.lines().enumerate() {
         if line.starts_with('#') || line.trim().is_empty() {
@@ -809,22 +837,28 @@ fn hid_decode(file: &Path, out: &mut impl Write) -> Result<(), CliError> {
     let mut assembler = DumpAssembler::default();
     let (mut acks, mut changes, mut unknown) = (0, 0, 0);
     let mut root = None;
+    let mut last_error = None;
     for report in &reports {
         match classify(report) {
             Incoming::Ack => acks += 1,
             Incoming::Change(_) => changes += 1,
             Incoming::Unknown => unknown += 1,
-            Incoming::DumpChunk(chunk) => {
-                if let Some(tree) = assembler
-                    .push(chunk)
-                    .map_err(|err| CliError::NoDump(err.to_string()))?
-                {
+            // A bad dump is skipped: a complete one may follow in the file.
+            Incoming::DumpChunk(chunk) => match assembler.push(chunk) {
+                Ok(Some(tree)) => {
                     root.get_or_insert(tree);
                 }
-            }
+                Ok(None) => {}
+                Err(err) => {
+                    assembler = DumpAssembler::default();
+                    last_error = Some(err.to_string());
+                }
+            },
         }
     }
-    let root = root.ok_or_else(|| CliError::NoDump("dump incomplete".to_owned()))?;
+    let root = root.ok_or_else(|| {
+        CliError::NoDump(last_error.unwrap_or_else(|| "dump incomplete".to_owned()))
+    })?;
     let state = BoardState::from_tree(&root);
     writeln!(
         out,
@@ -866,8 +900,22 @@ fn sudo(args: &[&str]) -> Result<(), CliError> {
     }
 }
 
-fn read_rule() -> Option<String> {
-    std::fs::read_to_string(rcp2_hid::UDEV_RULE_PATH).ok()
+/// The installed rule, `None` if there is none. Any other read error is an
+/// error: an unreadable file must not be mistaken for an absent one.
+fn read_rule() -> Result<Option<String>, CliError> {
+    match std::fs::read_to_string(rcp2_hid::UDEV_RULE_PATH) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::File {
+            path: PathBuf::from(rcp2_hid::UDEV_RULE_PATH),
+            source,
+        }),
+    }
+}
+
+fn file_err(path: &Path) -> impl FnOnce(io::Error) -> CliError + use<> {
+    let path = path.to_owned();
+    move |source| CliError::File { path, source }
 }
 
 /// Makes udev apply the rules again to the board, without replugging it.
@@ -883,7 +931,7 @@ fn reload_udev() -> Result<(), CliError> {
 
 fn hid_setup(out: &mut impl Write) -> Result<(), CliError> {
     let dest = rcp2_hid::UDEV_RULE_PATH;
-    match rcp2_hid::rule_state(read_rule().as_deref()) {
+    match rcp2_hid::rule_state(read_rule()?.as_deref()) {
         rcp2_hid::RuleState::UpToDate => {
             writeln!(out, "Access already set up ({dest}).")?;
             return Ok(());
@@ -895,19 +943,23 @@ fn hid_setup(out: &mut impl Write) -> Result<(), CliError> {
         out,
         "Installing {dest} so that your user can talk to the board (sudo may ask for your password)."
     )?;
-    // A private temporary copy, then `install` sets owner and mode in one step.
+    // A private temporary copy (mode 0600), then `install` sets owner and mode
+    // in one step. Removed on every path.
     let tmp = std::env::temp_dir().join(format!("rcp2ctl-udev-{}.rules", std::process::id()));
-    std::fs::OpenOptions::new()
+    let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(&tmp)
-        .and_then(|mut file| file.write_all(rcp2_hid::UDEV_RULE.as_bytes()))
-        .map_err(|source| PwError::Io {
-            path: tmp.clone(),
-            source,
-        })?;
-    let tmp_text = tmp.to_string_lossy().into_owned();
-    let installed = sudo(&["install", "-m", "644", &tmp_text, dest]);
+        .map_err(file_err(&tmp))
+        .and_then(|mut file| {
+            file.write_all(rcp2_hid::UDEV_RULE.as_bytes())
+                .map_err(file_err(&tmp))
+        });
+    let installed = written.and_then(|()| {
+        let tmp_text = tmp.to_string_lossy().into_owned();
+        sudo(&["install", "-m", "644", &tmp_text, dest])
+    });
     let _ = std::fs::remove_file(&tmp);
     installed?;
     reload_udev()?;

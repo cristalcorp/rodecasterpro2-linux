@@ -112,10 +112,11 @@ fn notification(data: &[u8]) -> Option<Change> {
     if len == 0 || padding.iter().any(|byte| *byte != 0) {
         return None;
     }
+    // Only fully decoded property changes count: any other shape (including
+    // the zero-padded last chunk of a dump) is treated as dump data.
     match decode_change(message).ok()? {
-        // A full sync never fits in one report: that shape is a dump chunk.
-        Change::FullSync(_) => None,
-        change => Some(change),
+        change @ Change::PropertyChanged { .. } => Some(change),
+        Change::FullSync(_) | Change::Other { .. } => None,
     }
 }
 
@@ -338,6 +339,15 @@ mod tests {
         }
         assert_eq!(changes, 1);
         assert_eq!(decoded, Some(root));
+    }
+
+    #[test]
+    fn a_padded_last_dump_chunk_is_not_a_notification() {
+        // Looks like "length 42, message, zeros" but is not a property change.
+        let mut report = vec![4, 42, 0, 0, 0, 0x07];
+        report.extend([0x41; 41]);
+        report.resize(256, 0);
+        assert!(matches!(classify(&report), Incoming::DumpChunk(_)));
     }
 
     #[test]

@@ -240,7 +240,7 @@ Prints the board's `hidraw` device. Opens nothing.
 Opens a session with the board and records what it sends, to study the
 protocol. Read-only. **Asks for confirmation** because of the fader freeze
 described in [Risks](#5-risks); `--yes` skips the question. Stops after the
-initial state dump, or after `N` seconds (default 10). The file must end in
+initial state dump, or after `N` seconds (1 to 60, default 10). If reading fails midway, the reports received so far are still saved; if the board cannot be reached, no file is left behind. The file must end in
 `.rcp2cap` and is never overwritten. It contains the board's serial number:
 keep it private (git ignores this extension).
 

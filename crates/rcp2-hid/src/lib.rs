@@ -246,34 +246,58 @@ impl Board {
     }
 }
 
+/// What [`capture`] recorded.
+#[derive(Debug)]
+pub struct Capture {
+    /// Every report received, in order.
+    pub reports: Vec<Report>,
+    /// The read error that ended the capture early, if any: the reports
+    /// received before it are kept.
+    pub error: Option<HidError>,
+}
+
 /// Handshakes and records every input report until `idle` passes without a
 /// report (after the first one) or `limit` is reached.
 ///
+/// The reading thread stays blocked on the device after this returns; that is
+/// fine for a one-shot command, and a long-running owner of the session keeps
+/// a single reader instead.
+///
 /// # Errors
 ///
-/// Returns [`HidError`] if the handshake fails or a read fails.
-pub fn capture(
-    board: &mut Board,
-    limit: Duration,
-    idle: Duration,
-) -> Result<Vec<Report>, HidError> {
+/// Returns [`HidError`] if reading cannot start or the handshake fails (the
+/// board then received nothing, or only the mode report). A read error during
+/// the capture is reported in [`Capture::error`] instead, with the reports
+/// received so far.
+pub fn capture(board: &mut Board, limit: Duration, idle: Duration) -> Result<Capture, HidError> {
     let start = Instant::now();
     let reports = board.reports(start)?;
     board.handshake()?;
     let mut captured = Vec::new();
-    while start.elapsed() < limit {
+    let mut error = None;
+    loop {
+        let left = limit.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            break;
+        }
         let wait = if captured.is_empty() {
-            limit.saturating_sub(start.elapsed())
+            left
         } else {
-            idle
+            idle.min(left)
         };
         match reports.recv_timeout(wait) {
             Ok(Ok(report)) => captured.push(report),
-            Ok(Err(err)) => return Err(io_err(&board.path)(err)),
+            Ok(Err(err)) => {
+                error = Some(io_err(&board.path)(err));
+                break;
+            }
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
         }
     }
-    Ok(captured)
+    Ok(Capture {
+        reports: captured,
+        error,
+    })
 }
 
 #[cfg(test)]
