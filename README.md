@@ -244,6 +244,13 @@ initial state dump, or after `N` seconds (default 10). The file must end in
 `.rcp2cap` and is never overwritten. It contains the board's serial number:
 keep it private (git ignores this extension).
 
+### `rcp2ctl hid decode <file>.rcp2cap`
+
+Decodes a capture offline — nothing is sent to the board — and shows the
+firmware version, each channel strip (position in the board's state tree,
+source, muted or not) and the fader positions (0–127). Sources not yet verified
+on hardware are shown as a raw code. The serial number is never printed.
+
 ### `rcp2ctl uninstall [--yes | --keep-pipewire-config]`
 
 Undoes everything the tool did. See [Uninstallation](#12-uninstallation).
