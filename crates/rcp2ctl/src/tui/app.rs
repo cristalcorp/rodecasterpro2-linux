@@ -99,6 +99,8 @@ impl App {
                 Action::None
             }
             KeyCode::F(5) => Action::Refresh,
+            // For terminals that keep F5 for themselves; the usual redraw key.
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Refresh,
             KeyCode::Char('r') => Action::RestoreOriginal,
             KeyCode::Char('o') => Action::ToggleOutputs,
             KeyCode::Char('p') => Action::EnablePersist,
@@ -221,6 +223,10 @@ mod tests {
         assert_eq!(press(&mut app, KeyCode::Char('p')), Action::EnablePersist);
         assert_eq!(press(&mut app, KeyCode::Char('r')), Action::RestoreOriginal);
         assert_eq!(press(&mut app, KeyCode::F(5)), Action::Refresh);
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Action::Refresh
+        );
     }
 
     #[test]

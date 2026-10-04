@@ -195,14 +195,16 @@ fn message_line(app: &App) -> Paragraph<'_> {
 }
 
 fn keys_line(app: &App) -> Paragraph<'static> {
+    Paragraph::new(keys_text(app)).style(Style::new().fg(Color::DarkGray))
+}
+
+/// Fits 80 columns, so `? help` and `q quit` stay visible.
+fn keys_text(app: &App) -> String {
     let context = match app.focus {
-        Focus::Apps => "1-6 send app to output",
-        Focus::Outputs => "Enter make default",
+        Focus::Apps => "1-6 route",
+        Focus::Outputs => "⏎ default",
     };
-    let keys = format!(
-        "↑↓ select  {context}  Tab switch  o outputs  p persist  r restore  ? help  q quit"
-    );
-    Paragraph::new(keys).style(Style::new().fg(Color::DarkGray))
+    format!("↑↓ move  {context}  Tab panel  o outputs  p persist  r restore  ? help  q quit")
 }
 
 const HELP: &[(&str, &str)] = &[
@@ -213,7 +215,7 @@ const HELP: &[(&str, &str)] = &[
     ("o", "named outputs on / off"),
     ("p", "keep outputs after reboot (install the config file)"),
     ("r", "restore the original PipeWire configuration"),
-    ("F5", "refresh now (also automatic every second)"),
+    ("F5 / Ctrl+L", "refresh now (also automatic every second)"),
     ("q / Esc", "quit"),
 ];
 
@@ -248,8 +250,9 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, render};
+    use super::{Mode, keys_text, render};
     use crate::tui::app::App;
+    use crate::tui::app::Focus;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use rcp2_audio::{Graph, PersistState};
@@ -298,5 +301,15 @@ mod tests {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
         app.show_help = true;
         assert!(screen(&app).contains("restore the original PipeWire configuration"));
+    }
+
+    #[test]
+    fn the_keys_line_fits_80_columns_in_both_panels() {
+        for focus in [Focus::Apps, Focus::Outputs] {
+            let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+            app.focus = focus;
+            let width = ratatui::text::Line::from(keys_text(&app)).width();
+            assert!(width <= 80, "{width} columns");
+        }
     }
 }

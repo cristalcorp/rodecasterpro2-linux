@@ -347,31 +347,45 @@ fn persist(
     } else {
         "named outputs are off, so rcp2ctl will not recreate them (`rcp2ctl outputs on`)"
     };
+    let undo = "Undo: `r` in the TUI or `rcp2ctl persist off` (restores the original exactly).";
     match state {
         Switch::On => {
             let contents = pipewire_config(&graph.rode()?)?;
+            // A file we did not write is taken over only after being saved.
+            let saved = if persist_state(&paths)? == PersistState::Foreign {
+                " (your previous file was saved and comes back on restore)"
+            } else {
+                ""
+            };
             match enable_persistence(&paths, &contents)? {
-                EnableOutcome::Unchanged => writeln!(out, "Persistence already on ({file}).")?,
-                EnableOutcome::Updated => writeln!(out, "Persistence on: updated {file}.")?,
+                EnableOutcome::Unchanged => {
+                    writeln!(out, "Outputs already kept after a reboot ({file}).")?;
+                }
+                EnableOutcome::Updated => writeln!(out, "Updated {file}.")?,
                 EnableOutcome::Enabled => writeln!(
                     out,
-                    "Persistence on: wrote {file}. The current outputs keep working; the \
-                     file takes over at the next PipeWire start. `rcp2ctl persist off` \
-                     restores the original state."
+                    "Outputs now kept after a reboot: wrote {file}{saved}. The current \
+                     outputs keep working. {undo}"
                 )?,
             }
         }
         Switch::Off => match disable_persistence(&paths)? {
-            DisableOutcome::AlreadyOff => writeln!(out, "Persistence already off.")?,
+            DisableOutcome::AlreadyOff => {
+                writeln!(
+                    out,
+                    "The original PipeWire configuration is already in place."
+                )?;
+            }
             DisableOutcome::Restored => writeln!(
                 out,
-                "Persistence off: original {file} restored. After the next PipeWire \
-                 restart, {after_restart}."
+                "Original PipeWire configuration restored ({file}). After the next \
+                 PipeWire restart, {after_restart}."
             )?,
             DisableOutcome::Removed => writeln!(
                 out,
-                "Persistence off: removed {file} (there was none originally). The current \
-                 outputs keep working until PipeWire restarts; then {after_restart}."
+                "Original PipeWire configuration restored: removed {file} (there was none). \
+                 The current outputs keep working until PipeWire restarts; then \
+                 {after_restart}."
             )?,
         },
     }
