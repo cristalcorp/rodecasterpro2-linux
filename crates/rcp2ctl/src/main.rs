@@ -1,5 +1,7 @@
 //! `rcp2ctl`: Linux control tool for the RØDECaster Pro II.
 
+mod daemon;
+mod service;
 mod settings;
 mod tui;
 
@@ -66,6 +68,13 @@ enum Command {
         /// Named output.
         channel: Channel,
     },
+    /// Show the board's own state (channels, mutes, faders), read from the
+    /// board service.
+    Board,
+    /// Run the board service in the foreground (normally started by systemd,
+    /// see `rcp2ctl hid setup`). Keeps the control session read, so the board's
+    /// faders keep working, and serves its state to the other commands.
+    Daemon,
     /// Board control interface (HID): read-only diagnostics.
     Hid {
         #[command(subcommand)]
@@ -160,10 +169,14 @@ enum CliError {
     BadCapture(PathBuf, usize),
     #[error("the capture holds no complete state dump ({0})")]
     NoDump(String),
-    #[error("`sudo {0}` failed")]
-    Sudo(String),
+    #[error(transparent)]
+    Daemon(#[from] daemon::DaemonError),
     #[error("{0} exists but was not written by rcp2ctl: left untouched")]
-    ForeignRule(&'static str),
+    ForeignFile(PathBuf),
+    #[error("the binary path {0} contains characters systemd cannot take; move the binary")]
+    UnsafeExePath(PathBuf),
+    #[error("`{0}` failed")]
+    CommandFailed(String),
     #[error("cannot write output: {0}")]
     Output(#[from] io::Error),
 }
@@ -215,6 +228,8 @@ fn run(command: Command, out: &mut impl Write) -> Result<(), CliError> {
         Command::Route { app, channel } => route(&prepare(&load_settings()?)?, &app, channel, out),
         Command::Default { channel } => set_default(&prepare(&load_settings()?)?, channel, out),
         Command::Hid { command } => hid(command, out),
+        Command::Board => board(out),
+        Command::Daemon => daemon::run(&mut io::stderr()).map_err(Into::into),
         Command::Persist { state } => {
             let settings = load_settings()?;
             persist(&prepare(&settings)?, &settings, state, out)
@@ -554,6 +569,18 @@ fn uninstall(yes: bool, keep_pipewire_config: bool, out: &mut impl Write) -> Res
         }
     }
 
+    // The board service: once it stops, nobody reads the board any more, so
+    // its faders freeze until it is replugged (I-007).
+    match service::remove() {
+        Ok(true) => writeln!(
+            out,
+            "Board service stopped and removed. Unplug and replug the board's USB cable \
+             so that its faders work again."
+        )?,
+        Ok(false) => {}
+        Err(err) => warn(out, format!("could not remove the board service: {err}"))?,
+    }
+
     // The udev rule from `rcp2ctl hid setup`, only if it is ours.
     if let Some(problem) = remove_udev_rule(out)? {
         warn(out, problem)?;
@@ -865,39 +892,31 @@ fn hid_decode(file: &Path, out: &mut impl Write) -> Result<(), CliError> {
         "{} report(s): {acks} acknowledgement(s), {changes} notification(s), {unknown} other",
         reports.len()
     )?;
-    writeln!(
-        out,
-        "Firmware: {}",
-        state.firmware.as_deref().unwrap_or("(not reported)")
-    )?;
     writeln!(out, "Nodes under the root: {}", root.children.len())?;
-    writeln!(out, "Channels (tree index, source, output):")?;
-    for channel in &state.channels {
-        let output = match channel.muted {
-            Some(true) => "muted",
-            Some(false) => "on",
-            None => "?",
-        };
-        let source = channel.source.to_string();
-        writeln!(out, "  0x{:03x}  {source:<10}  {output}", channel.index)?;
-    }
-    let faders: Vec<String> = state.faders.iter().map(ToString::to_string).collect();
-    writeln!(out, "Faders (0-127): {}", faders.join(" "))?;
-    Ok(())
+    let channels: Vec<_> = state
+        .channels
+        .iter()
+        .map(|channel| (channel.index, channel.source.to_string(), channel.muted))
+        .collect();
+    print_board(out, state.firmware.as_deref(), &channels, &state.faders)
 }
 
-/// Runs `sudo <args>` in the terminal (it may ask for the password).
-fn sudo(args: &[&str]) -> Result<(), CliError> {
-    let shown = args.join(" ");
-    let status = std::process::Command::new("sudo")
+/// Runs `program <args>` in the terminal (`sudo` may ask for the password).
+pub(crate) fn run_command(program: &str, args: &[&str]) -> Result<(), CliError> {
+    let shown = format!("{program} {}", args.join(" "));
+    let status = std::process::Command::new(program)
         .args(args)
         .status()
-        .map_err(|_| CliError::Sudo(shown.clone()))?;
+        .map_err(|_| CliError::CommandFailed(shown.clone()))?;
     if status.success() {
         Ok(())
     } else {
-        Err(CliError::Sudo(shown))
+        Err(CliError::CommandFailed(shown))
     }
+}
+
+fn sudo(args: &[&str]) -> Result<(), CliError> {
+    run_command("sudo", args)
 }
 
 /// The installed rule, `None` if there is none. Any other read error is an
@@ -929,14 +948,87 @@ fn reload_udev() -> Result<(), CliError> {
     ])
 }
 
+/// Installs and starts the board service for this binary.
+fn install_service(out: &mut impl Write) -> Result<(), CliError> {
+    let exe = std::env::current_exe().map_err(file_err(Path::new("/proc/self/exe")))?;
+    match service::install(&exe) {
+        Ok(unit) => writeln!(
+            out,
+            "Board service running ({}): it keeps the board's faders working and serves its \
+             state. `rcp2ctl uninstall` removes it.",
+            unit.display()
+        )?,
+        // Access itself is granted: say what is missing instead of failing.
+        Err(err) => writeln!(
+            out,
+            "Board access is set up, but the board service could not be installed ({err}). \
+             Without a systemd user session, run `rcp2ctl daemon` yourself while you use \
+             the board."
+        )?,
+    }
+    Ok(())
+}
+
+/// Prints a board state: shared by `board` (from the service) and `hid decode`.
+fn print_board(
+    out: &mut impl Write,
+    firmware: Option<&str>,
+    channels: &[(usize, String, Option<bool>)],
+    faders: &[i32],
+) -> Result<(), CliError> {
+    writeln!(out, "Firmware: {}", firmware.unwrap_or("(not reported)"))?;
+    writeln!(out, "Channels (tree index, source, output):")?;
+    for (index, source, muted) in channels {
+        let output = match muted {
+            Some(true) => "muted",
+            Some(false) => "on",
+            None => "?",
+        };
+        writeln!(out, "  0x{index:03x}  {source:<10}  {output}")?;
+    }
+    let faders: Vec<String> = faders.iter().map(ToString::to_string).collect();
+    writeln!(out, "Faders (0-127): {}", faders.join(" "))?;
+    Ok(())
+}
+
+fn board(out: &mut impl Write) -> Result<(), CliError> {
+    let state = daemon::query_state()?;
+    if !state.connected {
+        writeln!(
+            out,
+            "Board service running, but the board is not connected."
+        )?;
+        return Ok(());
+    }
+    if !state.state_known {
+        writeln!(
+            out,
+            "Board connected; its state is being read. Try again in a moment."
+        )?;
+        return Ok(());
+    }
+    let channels: Vec<_> = state
+        .channels
+        .iter()
+        .map(|channel| (channel.index, channel.source.clone(), channel.muted))
+        .collect();
+    print_board(out, state.firmware.as_deref(), &channels, &state.faders)?;
+    writeln!(
+        out,
+        "Changes applied since the last dump: {}",
+        state.notifications
+    )?;
+    Ok(())
+}
+
 fn hid_setup(out: &mut impl Write) -> Result<(), CliError> {
     let dest = rcp2_hid::UDEV_RULE_PATH;
     match rcp2_hid::rule_state(read_rule()?.as_deref()) {
         rcp2_hid::RuleState::UpToDate => {
             writeln!(out, "Access already set up ({dest}).")?;
-            return Ok(());
+            return install_service(out);
         }
-        rcp2_hid::RuleState::Foreign => return Err(CliError::ForeignRule(dest)),
+        rcp2_hid::RuleState::Foreign => return Err(CliError::ForeignFile(PathBuf::from(dest))),
         rcp2_hid::RuleState::Absent | rcp2_hid::RuleState::Outdated => {}
     }
     writeln!(
@@ -963,11 +1055,8 @@ fn hid_setup(out: &mut impl Write) -> Result<(), CliError> {
     let _ = std::fs::remove_file(&tmp);
     installed?;
     reload_udev()?;
-    writeln!(
-        out,
-        "Done: no replug needed. `rcp2ctl uninstall` removes it."
-    )?;
-    Ok(())
+    writeln!(out, "Access granted: no replug needed.")?;
+    install_service(out)
 }
 
 /// Counts only: the content holds the serial number and stays in the file.

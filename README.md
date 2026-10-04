@@ -128,13 +128,18 @@ dangerous commands cannot be sent at all:
 
 One effect is known and harmless, but you need to know about it:
 
-> **After a capture, the board's faders stop controlling the volume** until you
-> unplug and replug its USB cable. Nothing is damaged and no setting is lost.
-> The cause: once the tool has opened a session, the board keeps sending
-> notifications, and it freezes its controls when nobody reads them. On Windows
-> and macOS the system always reads them; on Linux it stops when the program
-> exits. A permanent fix is planned (see [Status and roadmap](#14-status-and-roadmap)).
-> Until then, **do not run a capture during a recording or a live show.**
+> **Once a session is open, the board's faders stop controlling the volume as
+> soon as nobody reads its control interface**, until you unplug and replug its
+> USB cable. Nothing is damaged and no setting is lost. The cause: the board
+> keeps sending notifications and freezes its controls when they are not read.
+> On Windows and macOS the system always reads them; on Linux it stops when the
+> program exits.
+>
+> The **board service** installed by `rcp2ctl hid setup` reads them for as long
+> as it runs, so this does not happen in normal use. It does happen after a
+> one-off `hid capture` without the service, and after the service is stopped
+> (for example by `rcp2ctl uninstall`): replug the board then. **Do not run a
+> capture during a recording or a live show.**
 
 ## 6. First steps
 
@@ -226,10 +231,24 @@ state. No PipeWire restart is needed either way.
 Prints the PipeWire configuration that `persist on` installs, without
 installing anything. Useful for packagers.
 
+### `rcp2ctl board`
+
+Shows the board's own state — firmware version, each channel strip (source,
+muted or not), fader positions (0–127) and how many changes were applied since
+the last full read — as kept up to date by the board service. Fails with a
+clear message if the service is not running.
+
+### `rcp2ctl daemon`
+
+Runs the board service in the foreground. You normally never run it yourself:
+`hid setup` installs it as a systemd user service started at login. See
+[The board service](#102-the-board-service).
+
 ### `rcp2ctl hid setup`
 
 Grants your user access to the board's control interface by installing a udev
-rule (asks for your `sudo` password). See [Board access](#101-board-access).
+rule (asks for your `sudo` password), then installs and starts the board
+service. Running it again updates both. See [Board access](#101-board-access).
 
 ### `rcp2ctl hid find`
 
@@ -283,14 +302,29 @@ replaces a file it did not write. `rcp2ctl uninstall` removes it.
 Distribution packages should ship `packaging/udev/70-rodecaster-pro-2.rules` in
 `/usr/lib/udev/rules.d/` instead.
 
-### 10.2 What is read
+### 10.2 The board service
+
+The service (`rcp2ctl daemon`, run by systemd as your user, never as root)
+opens the session with the board, keeps reading it so that the faders keep
+working, and keeps a copy of the board's state up to date from its
+notifications. When the board is unplugged it waits and reconnects on its own.
+
+Other commands ask it for the state through a socket in your private runtime
+directory (`$XDG_RUNTIME_DIR/rodecasterpro2-linux/board.sock`, mode 0600):
+only your user can talk to it. It is read-only: it never writes a setting to
+the board.
+
+It runs the binary that installed it: if you move or rebuild `rcp2ctl`
+elsewhere, run `rcp2ctl hid setup` again.
+
+### 10.3 What is read
 
 The board answers a session request with a dump of its whole state (about
 90 KB): channels and their sources, faders, mutes, processing, pads, system
 settings. The tool decodes it exactly (it is a JUCE `ValueTree`). Verified on
 firmware 1.6.8: fader positions and mute states match the board.
 
-### 10.3 What is never done
+### 10.4 What is never done
 
 - Sending any mode byte other than "normal mode".
 - Writing settings that were not read from the board first, or guessing setting
@@ -309,6 +343,8 @@ firmware 1.6.8: fader positions and mute states match the board.
 | `~/.local/share/rodecasterpro2-linux/original/` (record of the original) | `persist on` | `persist off`, `uninstall` |
 | Per-application output memory, default output (WirePlumber state) | `route`, `default` | your desktop's sound settings |
 | `/etc/udev/rules.d/70-rodecaster-pro-2.rules` | `hid setup` | `uninstall` |
+| `~/.config/systemd/user/rodecasterpro2-linux.service` (board service) | `hid setup` | `uninstall` |
+| `$XDG_RUNTIME_DIR/rodecasterpro2-linux/board.sock` (in memory) | while the service runs | stopping the service, logout |
 | Your `.rcp2cap` capture files | `hid capture` | delete them yourself |
 
 ## 12. Uninstallation
@@ -325,11 +361,13 @@ It:
 1. Asks **"Restore the original PipeWire configuration?"** if persistence was
    on. The default answer is yes (also without a terminal). `--yes` restores
    without asking; `--keep-pipewire-config` keeps the file without asking.
-2. Removes the board access rule, if `hid setup` installed it (asks for your
+2. Stops and removes the board service. **Unplug and replug the board's USB
+   cable afterwards**, so that its faders work again.
+3. Removes the board access rule, if `hid setup` installed it (asks for your
    `sudo` password).
-3. Removes the named outputs created at runtime.
-4. Removes the tool's settings.
-5. Tells you where the binary is, so you can delete it.
+4. Removes the named outputs created at runtime.
+5. Removes the tool's settings.
+6. Tells you where the binary is, so you can delete it.
 
 Every step runs even if a previous one fails; problems are listed and the
 command exits with an error. Files changed by hand and symbolic links are left
@@ -350,8 +388,13 @@ board (pavucontrol, *Configuration* tab).
 **The named outputs are missing after a reboot** — Expected without
 persistence: run `rcp2ctl` once, or turn persistence on.
 
-**The faders no longer change the volume** — A capture was run (see
-[Risks](#5-risks)). Unplug and replug the board's USB cable.
+**The faders no longer change the volume** — A session was opened and nobody
+reads the board any more: a capture was run without the service, or the
+service was stopped (see [Risks](#5-risks)). Unplug and replug the board's USB
+cable; with the service running, it does not happen again.
+
+**"the board service is not running"** — Run `rcp2ctl hid setup`. To see why
+it stopped: `journalctl --user -u rodecasterpro2-linux`.
 
 **"Permission denied" on `/dev/hidrawN`** — Run `rcp2ctl hid setup`.
 
@@ -367,8 +410,9 @@ opens the TUI; in scripts, use the commands from the reference.
 |---|---|
 | Named outputs, routing, default output | Done |
 | Terminal interface | Done (audio side) |
-| Reading the board's state | In progress: exact decoder validated on a capture |
-| Permanent fix for the fader freeze | Planned: a small user service owning the board session |
+| Reading the board's state | Done: exact decoder, board service, `rcp2ctl board` |
+| Fix for the fader freeze | Done while the board service runs |
+| Board state in the TUI | Next |
 | Live fader levels in the TUI | Planned (faders send no live notification; MIDI is being evaluated) |
 | Writing board settings (mutes, gain, processing) | Later, one setting type at a time, each tested on hardware first |
 
