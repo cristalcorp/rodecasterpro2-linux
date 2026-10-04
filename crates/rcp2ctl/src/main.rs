@@ -4,7 +4,8 @@ mod settings;
 mod tui;
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::Path;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -65,6 +66,11 @@ enum Command {
         /// Named output.
         channel: Channel,
     },
+    /// Board control interface (HID): read-only diagnostics.
+    Hid {
+        #[command(subcommand)]
+        command: HidCommand,
+    },
     /// Undo everything rcp2ctl did, before removing the binary.
     Uninstall {
         /// Restore the original PipeWire configuration without asking.
@@ -73,6 +79,33 @@ enum Command {
         /// Keep the PipeWire config file without asking.
         #[arg(long, conflicts_with = "yes")]
         keep_pipewire_config: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HidCommand {
+    /// Give your user access to the board's control interface (installs a udev
+    /// rule with sudo; `rcp2ctl uninstall` removes it).
+    Setup,
+    /// Show which hidraw node is the board's control interface (opens nothing).
+    Find,
+    /// Handshake with the board and record what it sends (read-only), to study
+    /// the protocol. The file contains the board's serial number: keep it private.
+    Capture {
+        /// Output file, must end in `.rcp2cap` (ignored by git).
+        file: PathBuf,
+        /// Stop after this many seconds at most (1 to 60).
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=60))]
+        seconds: u64,
+        /// Do not ask for confirmation (the faders still freeze until a replug).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Decode a capture file offline and show what it says about the board
+    /// (firmware, channels, mutes, faders). Never prints the serial number.
+    Decode {
+        /// A `.rcp2cap` file written by `rcp2ctl hid capture`.
+        file: PathBuf,
     },
 }
 
@@ -113,6 +146,24 @@ enum CliError {
     UninstallIncomplete(usize),
     #[error("the interactive interface needs a terminal; see `rcp2ctl --help` for commands")]
     NoTerminal,
+    #[error(transparent)]
+    Hid(#[from] rcp2_hid::HidError),
+    #[error(
+        "capture files must end in `.{CAPTURE_EXTENSION}` (git ignores them: they hold the serial number)"
+    )]
+    CaptureExtension,
+    #[error("{path}: {source}")]
+    File { path: PathBuf, source: io::Error },
+    #[error("capture interrupted after {0} report(s), saved anyway: {1}")]
+    CaptureInterrupted(usize, rcp2_hid::HidError),
+    #[error("{0}: not a valid capture file (line {1})")]
+    BadCapture(PathBuf, usize),
+    #[error("the capture holds no complete state dump ({0})")]
+    NoDump(String),
+    #[error("`sudo {0}` failed")]
+    Sudo(String),
+    #[error("{0} exists but was not written by rcp2ctl: left untouched")]
+    ForeignRule(&'static str),
     #[error("cannot write output: {0}")]
     Output(#[from] io::Error),
 }
@@ -163,6 +214,7 @@ fn run(command: Command, out: &mut impl Write) -> Result<(), CliError> {
         Command::Apps => apps(&prepare(&load_settings()?)?, out),
         Command::Route { app, channel } => route(&prepare(&load_settings()?)?, &app, channel, out),
         Command::Default { channel } => set_default(&prepare(&load_settings()?)?, channel, out),
+        Command::Hid { command } => hid(command, out),
         Command::Persist { state } => {
             let settings = load_settings()?;
             persist(&prepare(&settings)?, &settings, state, out)
@@ -420,6 +472,36 @@ fn ask(question: &str, default: bool, out: &mut impl Write) -> Result<bool, CliE
     }
 }
 
+/// Removes the udev rule if `hid setup` installed it. Returns the problem to
+/// report, if any; only a terminal write error stops it.
+fn remove_udev_rule(out: &mut impl Write) -> Result<Option<String>, CliError> {
+    let state = match read_rule() {
+        Ok(text) => rcp2_hid::rule_state(text.as_deref()),
+        Err(err) => return Ok(Some(format!("could not check the udev rule: {err}"))),
+    };
+    if !matches!(
+        state,
+        rcp2_hid::RuleState::UpToDate | rcp2_hid::RuleState::Outdated
+    ) {
+        return Ok(None);
+    }
+    writeln!(
+        out,
+        "Removing {} (sudo may ask for your password).",
+        rcp2_hid::UDEV_RULE_PATH
+    )?;
+    match sudo(&["rm", "-f", rcp2_hid::UDEV_RULE_PATH]).and_then(|()| reload_udev()) {
+        Ok(()) => {
+            writeln!(
+                out,
+                "Board access rule removed (fully effective after the next replug or login)."
+            )?;
+            Ok(None)
+        }
+        Err(err) => Ok(Some(format!("could not remove the udev rule: {err}"))),
+    }
+}
+
 fn uninstall(yes: bool, keep_pipewire_config: bool, out: &mut impl Write) -> Result<(), CliError> {
     // Goes as far as possible: each failed step is reported and the rest still runs.
     let mut problems = 0;
@@ -470,6 +552,11 @@ fn uninstall(yes: bool, keep_pipewire_config: bool, out: &mut impl Write) -> Res
                 paths.snapshot_dir.display()
             )?;
         }
+    }
+
+    // The udev rule from `rcp2ctl hid setup`, only if it is ours.
+    if let Some(problem) = remove_udev_rule(out)? {
+        warn(out, problem)?;
     }
 
     match remove_runtime_outputs() {
@@ -642,6 +729,276 @@ fn set_default(graph: &Graph, channel: Channel, out: &mut impl Write) -> Result<
         "{} is now the default output (remembered by WirePlumber).",
         channel.description()
     )?;
+    Ok(())
+}
+
+/// Extension of capture files, ignored by git.
+const CAPTURE_EXTENSION: &str = "rcp2cap";
+/// A capture ends once the board stays quiet this long after the burst.
+const CAPTURE_IDLE: Duration = Duration::from_millis(500);
+
+fn hid(command: HidCommand, out: &mut impl Write) -> Result<(), CliError> {
+    use std::fmt::Write as _;
+    let sys_class = Path::new(rcp2_hid::SYS_CLASS_HIDRAW);
+    match command {
+        HidCommand::Setup => hid_setup(out),
+        HidCommand::Decode { file } => hid_decode(&file, out),
+        HidCommand::Find => {
+            for path in rcp2_hid::find_devices(sys_class)? {
+                writeln!(out, "{}", path.display())?;
+            }
+            Ok(())
+        }
+        HidCommand::Capture { file, seconds, yes } => {
+            if file.extension().and_then(|ext| ext.to_str()) != Some(CAPTURE_EXTENSION) {
+                return Err(CliError::CaptureExtension);
+            }
+            // Known effect on Linux (I-007): once subscribed, the board's faders
+            // stop working when nobody reads its HID interface, until a replug.
+            writeln!(
+                out,
+                "Warning: after this capture the board's faders stop controlling the volume \
+                 until you unplug and replug its USB cable (nothing is damaged). Do not run \
+                 it during a recording or a live show."
+            )?;
+            if !yes && !ask("Capture now?", false, out)? {
+                writeln!(out, "Nothing sent to the board.")?;
+                return Ok(());
+            }
+            // Create the file first: never handshake for nothing, never overwrite.
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&file)
+                .map_err(file_err(&file))?;
+            let captured = rcp2_hid::find_device(sys_class)
+                .and_then(|path| rcp2_hid::Board::open(&path))
+                .and_then(|mut board| {
+                    rcp2_hid::capture(&mut board, Duration::from_secs(seconds), CAPTURE_IDLE)
+                });
+            let captured = match captured {
+                Ok(captured) => captured,
+                Err(err) => {
+                    // Nothing was recorded: do not leave an empty file behind.
+                    drop(output);
+                    let _ = std::fs::remove_file(&file);
+                    return Err(err.into());
+                }
+            };
+            let reports = &captured.reports;
+            let mut text = String::from("# rcp2 capture v1: <microseconds> <report hex>\n");
+            for report in reports {
+                // Writing to a String cannot fail.
+                let _ = write!(text, "{} ", report.at.as_micros());
+                for byte in &report.bytes {
+                    let _ = write!(text, "{byte:02x}");
+                }
+                text.push('\n');
+            }
+            output.write_all(text.as_bytes()).map_err(file_err(&file))?;
+            summarise_capture(reports, &file, out)?;
+            match captured.error {
+                Some(err) => Err(CliError::CaptureInterrupted(reports.len(), err)),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+/// Reads the reports of a capture file (`<microseconds> <hex>` per line).
+fn read_capture(file: &Path) -> Result<Vec<Vec<u8>>, CliError> {
+    let text = std::fs::read_to_string(file).map_err(file_err(file))?;
+    let mut reports = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let bad = || CliError::BadCapture(file.to_owned(), number + 1);
+        let hex = line.split_whitespace().nth(1).ok_or_else(bad)?;
+        if hex.len() % 2 != 0 {
+            return Err(bad());
+        }
+        let report = (0..hex.len())
+            .step_by(2)
+            .map(|at| {
+                hex.get(at..at + 2)
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+            })
+            .collect::<Option<Vec<u8>>>()
+            .ok_or_else(bad)?;
+        reports.push(report);
+    }
+    Ok(reports)
+}
+
+fn hid_decode(file: &Path, out: &mut impl Write) -> Result<(), CliError> {
+    use rcp2_proto::{BoardState, DumpAssembler, Incoming, classify};
+    let reports = read_capture(file)?;
+    let mut assembler = DumpAssembler::default();
+    let (mut acks, mut changes, mut unknown) = (0, 0, 0);
+    let mut root = None;
+    let mut last_error = None;
+    for report in &reports {
+        match classify(report) {
+            Incoming::Ack => acks += 1,
+            Incoming::Change(_) => changes += 1,
+            Incoming::Unknown => unknown += 1,
+            // A bad dump is skipped: a complete one may follow in the file.
+            Incoming::DumpChunk(chunk) => match assembler.push(chunk) {
+                Ok(Some(tree)) => {
+                    root.get_or_insert(tree);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    assembler = DumpAssembler::default();
+                    last_error = Some(err.to_string());
+                }
+            },
+        }
+    }
+    let root = root.ok_or_else(|| {
+        CliError::NoDump(last_error.unwrap_or_else(|| "dump incomplete".to_owned()))
+    })?;
+    let state = BoardState::from_tree(&root);
+    writeln!(
+        out,
+        "{} report(s): {acks} acknowledgement(s), {changes} notification(s), {unknown} other",
+        reports.len()
+    )?;
+    writeln!(
+        out,
+        "Firmware: {}",
+        state.firmware.as_deref().unwrap_or("(not reported)")
+    )?;
+    writeln!(out, "Nodes under the root: {}", root.children.len())?;
+    writeln!(out, "Channels (tree index, source, output):")?;
+    for channel in &state.channels {
+        let output = match channel.muted {
+            Some(true) => "muted",
+            Some(false) => "on",
+            None => "?",
+        };
+        let source = channel.source.to_string();
+        writeln!(out, "  0x{:03x}  {source:<10}  {output}", channel.index)?;
+    }
+    let faders: Vec<String> = state.faders.iter().map(ToString::to_string).collect();
+    writeln!(out, "Faders (0-127): {}", faders.join(" "))?;
+    Ok(())
+}
+
+/// Runs `sudo <args>` in the terminal (it may ask for the password).
+fn sudo(args: &[&str]) -> Result<(), CliError> {
+    let shown = args.join(" ");
+    let status = std::process::Command::new("sudo")
+        .args(args)
+        .status()
+        .map_err(|_| CliError::Sudo(shown.clone()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::Sudo(shown))
+    }
+}
+
+/// The installed rule, `None` if there is none. Any other read error is an
+/// error: an unreadable file must not be mistaken for an absent one.
+fn read_rule() -> Result<Option<String>, CliError> {
+    match std::fs::read_to_string(rcp2_hid::UDEV_RULE_PATH) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::File {
+            path: PathBuf::from(rcp2_hid::UDEV_RULE_PATH),
+            source,
+        }),
+    }
+}
+
+fn file_err(path: &Path) -> impl FnOnce(io::Error) -> CliError + use<> {
+    let path = path.to_owned();
+    move |source| CliError::File { path, source }
+}
+
+/// Makes udev apply the rules again to the board, without replugging it.
+fn reload_udev() -> Result<(), CliError> {
+    sudo(&["udevadm", "control", "--reload"])?;
+    sudo(&[
+        "udevadm",
+        "trigger",
+        "--subsystem-match=hidraw",
+        "--action=change",
+    ])
+}
+
+fn hid_setup(out: &mut impl Write) -> Result<(), CliError> {
+    let dest = rcp2_hid::UDEV_RULE_PATH;
+    match rcp2_hid::rule_state(read_rule()?.as_deref()) {
+        rcp2_hid::RuleState::UpToDate => {
+            writeln!(out, "Access already set up ({dest}).")?;
+            return Ok(());
+        }
+        rcp2_hid::RuleState::Foreign => return Err(CliError::ForeignRule(dest)),
+        rcp2_hid::RuleState::Absent | rcp2_hid::RuleState::Outdated => {}
+    }
+    writeln!(
+        out,
+        "Installing {dest} so that your user can talk to the board (sudo may ask for your password)."
+    )?;
+    // A private temporary copy (mode 0600), then `install` sets owner and mode
+    // in one step. Removed on every path.
+    let tmp = std::env::temp_dir().join(format!("rcp2ctl-udev-{}.rules", std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(file_err(&tmp))
+        .and_then(|mut file| {
+            file.write_all(rcp2_hid::UDEV_RULE.as_bytes())
+                .map_err(file_err(&tmp))
+        });
+    let installed = written.and_then(|()| {
+        let tmp_text = tmp.to_string_lossy().into_owned();
+        sudo(&["install", "-m", "644", &tmp_text, dest])
+    });
+    let _ = std::fs::remove_file(&tmp);
+    installed?;
+    reload_udev()?;
+    writeln!(
+        out,
+        "Done: no replug needed. `rcp2ctl uninstall` removes it."
+    )?;
+    Ok(())
+}
+
+/// Counts only: the content holds the serial number and stays in the file.
+fn summarise_capture(
+    reports: &[rcp2_hid::Report],
+    file: &Path,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let bytes: usize = reports.iter().map(|report| report.bytes.len()).sum();
+    writeln!(
+        out,
+        "Captured {} report(s), {bytes} bytes, into {}.",
+        reports.len(),
+        file.display()
+    )?;
+    let mut ids: Vec<(u8, usize)> = Vec::new();
+    for id in reports
+        .iter()
+        .filter_map(|report| report.bytes.first().copied())
+    {
+        match ids.iter_mut().find(|(known, _)| *known == id) {
+            Some((_, count)) => *count += 1,
+            None => ids.push((id, 1)),
+        }
+    }
+    for (id, count) in ids {
+        writeln!(out, "  report {id}: {count}")?;
+    }
+    if let Some(last) = reports.last() {
+        writeln!(out, "  last report after {} ms", last.at.as_millis())?;
+    }
     Ok(())
 }
 

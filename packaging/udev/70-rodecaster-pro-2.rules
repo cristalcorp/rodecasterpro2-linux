@@ -1,0 +1,9 @@
+# rodecasterpro2-linux: give the logged-in user access to the RØDECaster Pro II
+# control interface (hidraw), without root.
+#
+# Installed by `rcp2ctl hid setup`, removed by `rcp2ctl uninstall`. Packages
+# should ship it in /usr/lib/udev/rules.d/ instead.
+#
+# Only the product ID verified on hardware is listed; other modes or firmware
+# versions may use other IDs and are not trusted until checked.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="19f7", ATTRS{idProduct}=="0078", TAG+="uaccess"
