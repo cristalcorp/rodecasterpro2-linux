@@ -8,10 +8,11 @@ use ratatui::widgets::{
     Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
 };
 use rcp2_audio::{Channel, PersistState};
+use rcp2_proto::InputSource;
 
-use super::app::{App, Focus, Level};
+use super::app::{App, BoardIssue, Focus, Level};
 use crate::daemon::{ChannelDto, StateDto};
-use crate::{channel_of, output_label};
+use crate::{BOARD_BEING_READ, BOARD_NOT_CONNECTED, channel_of, mute_label, output_label};
 
 /// Golden yellow accent.
 const ACCENT: Color = Color::Rgb(255, 191, 0);
@@ -25,10 +26,14 @@ pub(crate) struct Mode {
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
+    let board = BoardPanel::new(app);
+    // The console never takes the room of the body, the message or the keys.
+    let room = frame.area().height.saturating_sub(1 + MIN_BODY + 1 + 1);
+    let console_height = board.height().min(room.max(3));
     let [header, body, console, message, keys] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(8),
-        Constraint::Length(console_height(app)),
+        Constraint::Min(MIN_BODY),
+        Constraint::Length(console_height),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -37,9 +42,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
         Layout::horizontal([Constraint::Length(30), Constraint::Min(40)]).areas(body);
 
     frame.render_widget(header_line(app, mode), header);
-    render_outputs(frame, app, outputs);
+    render_outputs(frame, app, &board, outputs);
     render_apps(frame, app, apps);
-    render_console(frame, app, console);
+    render_console(frame, &board, console);
     frame.render_widget(message_line(app), message);
     frame.render_widget(keys_line(app), keys);
     if app.show_help {
@@ -97,7 +102,7 @@ fn panel(title: &str, focused: bool) -> Block<'_> {
     Block::bordered().title(title).border_style(style)
 }
 
-fn render_outputs(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_outputs(frame: &mut Frame<'_>, app: &App, board: &BoardPanel<'_>, area: Rect) {
     let streams = app.graph.app_streams();
     let default = default_channel(app);
     let items: Vec<ListItem<'_>> = Channel::ALL
@@ -126,7 +131,7 @@ fn render_outputs(frame: &mut Frame<'_>, app: &App, area: Rect) {
             if default == Some(channel) {
                 spans.push(Span::styled(" ★", Style::new().fg(ACCENT)));
             }
-            if let Some(fader) = fader_of(app, channel) {
+            if let Some(fader) = board.fader_of(channel) {
                 spans.push(Span::styled(
                     format!(" F{fader}"),
                     Style::new().fg(Color::DarkGray),
@@ -143,87 +148,138 @@ fn render_outputs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// The board's name for the source feeding a named output, when known.
-const fn source_label(channel: Channel) -> Option<&'static str> {
+/// Smallest height of the Outputs/Applications body.
+const MIN_BODY: u16 = 6;
+
+/// The board's source feeding a named output, when known.
+const fn channel_source(channel: Channel) -> Option<InputSource> {
     match channel {
-        Channel::Chat => Some("Chat"),
-        Channel::Usb1 => Some("USB 1"),
-        Channel::Game => Some("Game"),
-        Channel::Music => Some("Music"),
+        Channel::Chat => Some(InputSource::Chat),
+        Channel::Usb1 => Some(InputSource::Usb1),
+        Channel::Game => Some(InputSource::Game),
+        Channel::Music => Some(InputSource::Music),
         Channel::A | Channel::B => None,
     }
 }
 
-/// The board's channel strips worth showing, with their fader number
-/// (strip `n` sits on fader `n + 1`, verified on hardware; strips beyond the
-/// last fader have none).
-fn strips(state: &StateDto) -> Vec<(Option<usize>, &ChannelDto)> {
+/// One channel strip as shown, with its fader (strip `n` sits on fader
+/// `n + 1`, verified on hardware; strips past the last fader have none).
+struct Strip<'a> {
+    fader: Option<usize>,
+    channel: &'a ChannelDto,
+    level: Option<i32>,
+}
+
+/// What the Console panel shows, computed once per frame.
+enum BoardPanel<'a> {
+    State {
+        /// Strips worth showing (empty ones hidden, unreadable ones kept).
+        strips: Vec<Strip<'a>>,
+        /// The last complete state, shown while the service reads the board again.
+        refreshing: bool,
+    },
+    Message(String),
+}
+
+impl<'a> BoardPanel<'a> {
+    fn new(app: &'a App) -> Self {
+        let shown = |state: &'a StateDto, refreshing| Self::State {
+            strips: strips(state),
+            refreshing,
+        };
+        match &app.board {
+            None => Self::Message("Asking the board service…".to_owned()),
+            Some(Err(BoardIssue::NotRunning)) => Self::Message(
+                "Board service not running: `rcp2ctl hid setup` installs it.".to_owned(),
+            ),
+            Some(Err(BoardIssue::Other(reason))) => {
+                Self::Message(format!("Board service: {reason}"))
+            }
+            Some(Ok(state)) if state.connected && state.state_known => shown(state, false),
+            Some(Ok(state)) if state.connected => app.last_known.as_ref().map_or_else(
+                || Self::Message(BOARD_BEING_READ.to_owned()),
+                |last| shown(last, true),
+            ),
+            Some(Ok(_)) => Self::Message(BOARD_NOT_CONNECTED.to_owned()),
+        }
+    }
+
+    /// Rows wanted: borders, header and one per strip; one line otherwise.
+    fn height(&self) -> u16 {
+        match self {
+            Self::State { strips, .. } => {
+                u16::try_from(strips.len()).map_or(u16::MAX, |rows| rows.saturating_add(3))
+            }
+            Self::Message(_) => 3,
+        }
+    }
+
+    /// The fader carrying a named output's channel, matched by source code.
+    fn fader_of(&self, channel: Channel) -> Option<usize> {
+        let code = channel_source(channel)?.code()?;
+        match self {
+            Self::State { strips, .. } => strips.iter().find_map(|strip| {
+                (strip.channel.code == Some(code))
+                    .then_some(strip.fader)
+                    .flatten()
+            }),
+            Self::Message(_) => None,
+        }
+    }
+}
+
+fn strips(state: &StateDto) -> Vec<Strip<'_>> {
+    let empty = InputSource::Empty.code();
     state
         .channels
         .iter()
         .enumerate()
-        .filter(|(_, channel)| channel.source != "(empty)")
-        .map(|(position, channel)| {
-            (
-                (position < state.faders.len()).then_some(position + 1),
-                channel,
-            )
+        .filter(|(_, channel)| channel.code != empty)
+        .map(|(position, channel)| Strip {
+            fader: (position < state.faders.len()).then_some(position + 1),
+            channel,
+            level: state.faders.get(position).copied().flatten(),
         })
         .collect()
 }
 
-fn known_state(app: &App) -> Option<&StateDto> {
-    match &app.board {
-        Some(Ok(state)) if state.connected && state.state_known => Some(state),
-        _ => None,
-    }
-}
-
-/// The fader carrying a named output's channel on the board, if known.
-fn fader_of(app: &App, channel: Channel) -> Option<usize> {
-    let label = source_label(channel)?;
-    strips(known_state(app)?)
-        .into_iter()
-        .find(|(_, strip)| strip.source == label)
-        .and_then(|(fader, _)| fader)
-}
-
-fn console_height(app: &App) -> u16 {
-    // Borders plus header row plus one row per strip; one line otherwise.
-    known_state(app).map_or(3, |state| {
-        u16::try_from(strips(state).len()).map_or(3, |rows| rows.saturating_add(3))
-    })
-}
-
-fn render_console(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let block = panel(" Console ", false);
-    let Some(state) = known_state(app) else {
-        let text = match &app.board {
-            Some(Ok(state)) if state.connected => "Reading the board's state…",
-            Some(Ok(_)) => "Board service running; the board is not connected.",
-            Some(Err(_)) | None => "Board service not running: `rcp2ctl hid setup` installs it.",
-        };
-        frame.render_widget(
-            Paragraph::new(text)
-                .style(Style::new().fg(Color::DarkGray))
-                .block(block),
-            area,
-        );
-        return;
+fn render_console(frame: &mut Frame<'_>, board: &BoardPanel<'_>, area: Rect) {
+    let (strips, refreshing) = match board {
+        BoardPanel::State { strips, refreshing } => (strips, *refreshing),
+        BoardPanel::Message(text) => {
+            frame.render_widget(
+                Paragraph::new(text.as_str())
+                    .style(Style::new().fg(Color::DarkGray))
+                    .block(panel(" Console ", false)),
+                area,
+            );
+            return;
+        }
     };
-    let rows = strips(state).into_iter().map(|(fader, strip)| {
-        let (output, style) = match strip.muted {
-            Some(true) => ("muted", Style::new().fg(Color::Red)),
-            Some(false) => ("on", Style::new().fg(Color::Green)),
-            None => ("?", Style::new()),
+    let title = if refreshing {
+        " Console (refreshing…) "
+    } else {
+        " Console "
+    };
+    let rows = strips.iter().map(|strip| {
+        let style = match strip.channel.muted {
+            Some(true) => Style::new().fg(Color::Red),
+            Some(false) => Style::new().fg(Color::Green),
+            None => Style::new(),
         };
-        let level = fader
-            .and_then(|fader| state.faders.get(fader - 1))
-            .map_or_else(String::new, |level| fader_bar(*level));
+        let level = match (strip.fader, strip.level) {
+            (Some(_), Some(level)) => fader_bar(level),
+            (Some(_), None) => "?".to_owned(),
+            (None, _) => String::new(),
+        };
         Row::new(vec![
-            Cell::from(fader.map_or_else(|| "-".to_owned(), |fader| format!("F{fader}"))),
-            Cell::from(strip.source.clone()),
-            Cell::from(output).style(style),
+            Cell::from(
+                strip
+                    .fader
+                    .map_or_else(|| "-".to_owned(), |fader| format!("F{fader}")),
+            ),
+            Cell::from(strip.channel.source.clone()),
+            Cell::from(mute_label(strip.channel.muted)).style(style),
             Cell::from(level),
         ])
     });
@@ -239,7 +295,7 @@ fn render_console(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ],
     )
     .header(header)
-    .block(block);
+    .block(panel(title, false));
     frame.render_widget(table, area);
 }
 
@@ -366,8 +422,8 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{Mode, keys_text, render};
-    use crate::tui::app::App;
     use crate::tui::app::Focus;
+    use crate::tui::app::{App, BoardIssue};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use rcp2_audio::{Graph, PersistState};
@@ -411,48 +467,111 @@ mod tests {
         assert!(screen.contains("PipeWire ALSA [qbz]"), "{screen}");
     }
 
-    #[test]
-    fn shows_the_board_and_the_fader_of_each_output() {
+    fn board_state(known: bool) -> crate::daemon::StateDto {
         use crate::daemon::{ChannelDto, StateDto};
-        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        let strip = |index, source: &str, muted| ChannelDto {
+        let strip = |index, source: &str, code, muted| ChannelDto {
             index,
             source: source.to_owned(),
+            code,
             muted: Some(muted),
         };
-        app.board = Some(Ok(StateDto {
-            version: 1,
+        StateDto {
+            version: crate::daemon::PROTOCOL_VERSION,
             connected: true,
-            state_known: true,
+            state_known: known,
             firmware: Some("1.7.6".to_owned()),
-            channels: vec![
-                strip(0x1A, "Mic 1", true),
-                strip(0x1B, "USB 1", false),
-                strip(0x1C, "Chat", false),
-                strip(0x1D, "Music", false),
-                strip(0x1E, "Game", false),
-                strip(0x1F, "(empty)", false),
-                strip(0x103, "source 9", false),
-            ],
-            faders: vec![45, 26, 28, 22, 127, 0],
+            channels: if known {
+                vec![
+                    strip(0x1A, "Mic 1", Some(0), true),
+                    strip(0x1B, "USB 1", Some(7), false),
+                    strip(0x1C, "Chat", Some(8), false),
+                    strip(0x1D, "Music", Some(13), false),
+                    strip(0x1E, "Game", Some(12), false),
+                    strip(0x1F, "(empty)", Some(-1), false),
+                    strip(0x20, "?", None, false),
+                    strip(0x103, "source 9", Some(9), false),
+                ]
+            } else {
+                vec![]
+            },
+            faders: if known {
+                vec![
+                    Some(45),
+                    Some(26),
+                    Some(28),
+                    Some(22),
+                    Some(127),
+                    Some(0),
+                    None,
+                ]
+            } else {
+                vec![]
+            },
             notifications: 3,
-        }));
+        }
+    }
+
+    #[test]
+    fn shows_the_board_and_the_fader_of_each_output() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.set_board(Ok(board_state(true)));
         let screen = screen(&app);
         assert!(screen.contains("3 RØDE Game   ♪1 ★ F5"), "{screen}");
         assert!(screen.contains("F1"), "{screen}");
         assert!(screen.contains("Mic 1"), "{screen}");
         assert!(screen.contains("muted"), "{screen}");
         assert!(screen.contains("████████████ 127"), "{screen}");
-        // Empty strips are hidden; a strip past the last fader has none.
+        // Empty strips are hidden; an unreadable source is shown, with an
+        // unreadable level; a strip past the last fader has none.
         assert!(!screen.contains("(empty)"), "{screen}");
+        assert!(screen.contains("F7     ?"), "{screen}");
         assert!(screen.contains("source 9"), "{screen}");
     }
 
     #[test]
-    fn says_how_to_start_the_service_when_it_is_not_running() {
+    fn keeps_the_last_state_while_the_board_is_read_again() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.board = Some(Err("not running".to_owned()));
+        app.set_board(Ok(board_state(true)));
+        app.set_board(Ok(board_state(false)));
+        let screen = screen(&app);
+        assert!(screen.contains("Console (refreshing…)"), "{screen}");
+        assert!(screen.contains("F5"), "{screen}");
+    }
+
+    #[test]
+    fn explains_why_the_board_state_is_missing() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.set_board(Err(BoardIssue::NotRunning));
         assert!(screen(&app).contains("rcp2ctl hid setup"));
+        app.set_board(Err(BoardIssue::Other("socket timed out".to_owned())));
+        let screen = screen(&app);
+        assert!(
+            screen.contains("Board service: socket timed out"),
+            "{screen}"
+        );
+        assert!(!screen.contains("hid setup"), "{screen}");
+    }
+
+    #[test]
+    fn a_short_terminal_keeps_the_message_and_keys_lines() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.set_board(Ok(board_state(true)));
+        app.message = Some((crate::tui::app::Level::Info, "hello there".to_owned()));
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        let mode = Mode {
+            outputs_on: true,
+            persist: Some(PersistState::Off),
+        };
+        terminal.draw(|frame| render(frame, &app, mode)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("hello there"));
+        assert!(text.contains("q quit"));
     }
 
     #[test]

@@ -30,7 +30,8 @@ const MAX_REQUEST: u64 = 256;
 /// How long a client may take to send its request.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Version of the socket protocol.
-const PROTOCOL_VERSION: u32 = 1;
+/// 2: channels carry their source code, fader levels may be unreadable.
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
 /// Least time between two requests for a new dump.
 const RESYNC_EVERY: Duration = Duration::from_secs(5);
 /// Notifications kept while waiting for a dump; beyond that, a new dump is
@@ -78,6 +79,9 @@ pub(crate) struct ChannelDto {
     pub(crate) index: usize,
     /// Human-readable source.
     pub(crate) source: String,
+    /// The board's source code (`channelInputSource`), if readable.
+    #[serde(default)]
+    pub(crate) code: Option<i32>,
     /// Output muted, if reported.
     pub(crate) muted: Option<bool>,
 }
@@ -92,7 +96,8 @@ pub(crate) struct StateDto {
     pub(crate) state_known: bool,
     pub(crate) firmware: Option<String>,
     pub(crate) channels: Vec<ChannelDto>,
-    pub(crate) faders: Vec<i32>,
+    /// One entry per fader; `None` if its level is unreadable.
+    pub(crate) faders: Vec<Option<i32>>,
     /// Notifications applied since the last full state dump.
     pub(crate) notifications: u64,
 }
@@ -111,6 +116,7 @@ impl StateDto {
                 .map(|channel| ChannelDto {
                     index: channel.index,
                     source: channel.source.to_string(),
+                    code: channel.source.code(),
                     muted: channel.muted,
                 })
                 .collect(),

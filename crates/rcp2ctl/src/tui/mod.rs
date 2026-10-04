@@ -12,7 +12,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event};
 use rcp2_audio::{Graph, PersistPaths, PwError, persist_state, snapshot};
 
-use self::app::{Action, App, BoardView, Level};
+use self::app::{Action, App, BoardIssue, BoardView, Level};
 use self::view::Mode;
 use crate::settings::{self, Settings};
 use crate::{CliError, Switch, outputs, persist, prepare, route, set_default};
@@ -22,13 +22,31 @@ const REFRESH_EVERY: Duration = Duration::from_secs(1);
 /// How long to wait for a key before handling background refreshes.
 const INPUT_POLL: Duration = Duration::from_millis(100);
 
-/// A graph snapshot and when it was started (older ones are ignored), with
-/// the board service's view of the board.
-type Snapshot = (Instant, Result<Graph, PwError>, BoardView);
+/// A graph snapshot and when it was started: older ones are ignored.
+type Snapshot = (Instant, Result<Graph, PwError>);
 
-/// Asks the board service for the board state (fast: a local socket).
+/// Asks the board service for the board state.
 fn board_view() -> BoardView {
-    crate::daemon::query_state().map_err(|err| err.to_string())
+    match crate::daemon::query_state() {
+        Ok(state) if state.version == crate::daemon::PROTOCOL_VERSION => Ok(state),
+        Ok(_) => Err(BoardIssue::Other(
+            "the running service is another version: run `rcp2ctl hid setup` again".to_owned(),
+        )),
+        Err(crate::daemon::DaemonError::NotRunning) => Err(BoardIssue::NotRunning),
+        Err(err) => Err(BoardIssue::Other(err.to_string())),
+    }
+}
+
+/// Asks the board service for the board state every second, on its own
+/// thread: a slow service never delays the graph or the keyboard.
+fn spawn_board_watcher() -> Receiver<BoardView> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        while sender.send(board_view()).is_ok() {
+            thread::sleep(REFRESH_EVERY);
+        }
+    });
+    receiver
 }
 
 pub(crate) fn run() -> Result<(), CliError> {
@@ -36,7 +54,7 @@ pub(crate) fn run() -> Result<(), CliError> {
     let mut settings = settings::load(&settings_path)?;
     // Before the alternate screen, so its notice is visible after quitting.
     let mut app = App::new(prepare(&settings)?);
-    app.board = Some(board_view());
+    let boards = spawn_board_watcher();
     let (requests, snapshots) = spawn_refresher();
 
     let mut terminal = ratatui::try_init()?;
@@ -47,6 +65,7 @@ pub(crate) fn run() -> Result<(), CliError> {
         &settings_path,
         &requests,
         &snapshots,
+        &boards,
     );
     ratatui::restore();
     result
@@ -60,10 +79,7 @@ fn spawn_refresher() -> (Sender<()>, Receiver<Snapshot>) {
     thread::spawn(move || {
         while let Ok(()) | Err(RecvTimeoutError::Timeout) = requests.recv_timeout(REFRESH_EVERY) {
             let started = Instant::now();
-            if snapshot_sender
-                .send((started, snapshot(), board_view()))
-                .is_err()
-            {
+            if snapshot_sender.send((started, snapshot())).is_err() {
                 break;
             }
         }
@@ -89,6 +105,7 @@ fn event_loop(
     settings_path: &Path,
     requests: &Sender<()>,
     snapshots: &Receiver<Snapshot>,
+    boards: &Receiver<BoardView>,
 ) -> Result<(), CliError> {
     let (mut mode, error) = current_mode(settings);
     if let Some(error) = error {
@@ -101,9 +118,10 @@ fn event_loop(
     loop {
         terminal.draw(|frame| view::render(frame, app, mode))?;
 
-        while let Ok((started, refresh, board)) = snapshots.try_recv() {
-            // Actions never change the board: its view is always fresh enough.
-            app.board = Some(board);
+        while let Ok(board) = boards.try_recv() {
+            app.set_board(board);
+        }
+        while let Ok((started, refresh)) = snapshots.try_recv() {
             if started < fresh_after {
                 continue;
             }

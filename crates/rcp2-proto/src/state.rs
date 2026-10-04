@@ -22,6 +22,8 @@ pub enum InputSource {
     Music,
     /// Code `-1`: nothing assigned.
     Empty,
+    /// No readable `channelInputSource` (missing or not an integer).
+    Unknown,
     /// Any other code, not verified yet.
     Code(i32),
 }
@@ -41,6 +43,22 @@ impl InputSource {
             other => Self::Code(other),
         }
     }
+
+    /// The `channelInputSource` code, `None` for [`InputSource::Unknown`].
+    #[must_use]
+    pub const fn code(self) -> Option<i32> {
+        match self {
+            Self::Mic1 => Some(0),
+            Self::Usb1 => Some(7),
+            Self::Chat => Some(8),
+            Self::SmartPads => Some(11),
+            Self::Game => Some(12),
+            Self::Music => Some(13),
+            Self::Empty => Some(-1),
+            Self::Code(code) => Some(code),
+            Self::Unknown => None,
+        }
+    }
 }
 
 impl std::fmt::Display for InputSource {
@@ -53,6 +71,7 @@ impl std::fmt::Display for InputSource {
             Self::Game => f.write_str("Game"),
             Self::Music => f.write_str("Music"),
             Self::Empty => f.write_str("(empty)"),
+            Self::Unknown => f.write_str("?"),
             Self::Code(code) => write!(f, "source {code}"),
         }
     }
@@ -76,8 +95,9 @@ pub struct BoardState {
     pub firmware: Option<String>,
     /// Channel strips, in tree order.
     pub channels: Vec<ChannelState>,
-    /// Fader positions (`PHYSICALINTERFACE/FADER.faderLevel`, 0–127), in order.
-    pub faders: Vec<i32>,
+    /// Fader positions (`PHYSICALINTERFACE/FADER.faderLevel`, 0–127), one
+    /// entry per fader in order; `None` if a level is unreadable.
+    pub faders: Vec<Option<i32>>,
 }
 
 impl BoardState {
@@ -96,7 +116,7 @@ impl BoardState {
                 index,
                 source: match channel.property("channelInputSource") {
                     Some(Var::Int(code)) => InputSource::from_code(*code),
-                    _ => InputSource::Empty,
+                    _ => InputSource::Unknown,
                 },
                 muted: match channel.property("channelOutputMute") {
                     Some(Var::Bool(muted)) => Some(*muted),
@@ -107,7 +127,8 @@ impl BoardState {
         let faders = root
             .children_named("PHYSICALINTERFACE")
             .flat_map(|(_, panel)| panel.children_named("FADER"))
-            .filter_map(|(_, fader)| match fader.property("faderLevel") {
+            // One entry per fader, readable or not, so positions never shift.
+            .map(|(_, fader)| match fader.property("faderLevel") {
                 Some(Var::Int(level)) => Some(*level),
                 _ => None,
             })
@@ -172,7 +193,7 @@ mod tests {
         );
         let state = BoardState::from_tree(&root);
         assert_eq!(state.firmware.as_deref(), Some("1.7.6"));
-        assert_eq!(state.faders, [45, 26]);
+        assert_eq!(state.faders, [Some(45), Some(26)]);
         assert_eq!(
             state.channels,
             [
@@ -198,6 +219,37 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn unreadable_values_keep_their_place() {
+        let root = node(
+            "Rodecaster",
+            vec![],
+            vec![
+                node(
+                    "PHYSICALINTERFACE",
+                    vec![],
+                    vec![
+                        node("FADER", vec![("faderLevel", Var::Double(0.5))], vec![]),
+                        node("FADER", vec![("faderLevel", Var::Int(9))], vec![]),
+                    ],
+                ),
+                node(
+                    "CHANNEL",
+                    vec![("channelInputSource", Var::Bool(true))],
+                    vec![],
+                ),
+            ],
+        );
+        let state = BoardState::from_tree(&root);
+        assert_eq!(state.faders, [None, Some(9)]);
+        assert_eq!(state.channels[0].source, InputSource::Unknown);
+        assert_eq!(InputSource::Unknown.code(), None);
+        assert_eq!(InputSource::Game.code(), Some(12));
+        for code in [-1, 0, 7, 8, 9, 11, 12, 13] {
+            assert_eq!(InputSource::from_code(code).code(), Some(code));
+        }
     }
 
     #[test]

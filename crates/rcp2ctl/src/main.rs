@@ -1051,24 +1051,36 @@ fn install_service(out: &mut impl Write) -> Result<(), CliError> {
     Ok(())
 }
 
+/// How a channel's output state is shown, in the CLI and the TUI.
+pub(crate) const fn mute_label(muted: Option<bool>) -> &'static str {
+    match muted {
+        Some(true) => "muted",
+        Some(false) => "on",
+        None => "?",
+    }
+}
+
+/// Shown while the board service has no state to give.
+pub(crate) const BOARD_NOT_CONNECTED: &str = "{BOARD_NOT_CONNECTED}";
+/// Shown while the board service reads the board's state.
+pub(crate) const BOARD_BEING_READ: &str = "Board connected; its state is being read.";
+
 /// Prints a board state: shared by `board` (from the service) and `hid decode`.
 fn print_board(
     out: &mut impl Write,
     firmware: Option<&str>,
     channels: &[(usize, String, Option<bool>)],
-    faders: &[i32],
+    faders: &[Option<i32>],
 ) -> Result<(), CliError> {
     writeln!(out, "Firmware: {}", firmware.unwrap_or("(not reported)"))?;
     writeln!(out, "Channels (tree index, source, output):")?;
     for (index, source, muted) in channels {
-        let output = match muted {
-            Some(true) => "muted",
-            Some(false) => "on",
-            None => "?",
-        };
-        writeln!(out, "  0x{index:03x}  {source:<10}  {output}")?;
+        writeln!(out, "  0x{index:03x}  {source:<10}  {}", mute_label(*muted))?;
     }
-    let faders: Vec<String> = faders.iter().map(ToString::to_string).collect();
+    let faders: Vec<String> = faders
+        .iter()
+        .map(|level| level.map_or_else(|| "?".to_owned(), |level| level.to_string()))
+        .collect();
     writeln!(out, "Faders (0-127): {}", faders.join(" "))?;
     Ok(())
 }
@@ -1083,10 +1095,7 @@ fn board(out: &mut impl Write) -> Result<(), CliError> {
         return Ok(());
     }
     if !state.state_known {
-        writeln!(
-            out,
-            "Board connected; its state is being read. Try again in a moment."
-        )?;
+        writeln!(out, "{BOARD_BEING_READ} Try again in a moment.")?;
         return Ok(());
     }
     let channels: Vec<_> = state

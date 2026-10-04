@@ -3,6 +3,8 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use rcp2_audio::{Channel, Graph};
 
+use crate::daemon::StateDto;
+
 /// Which panel receives the arrow keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Focus {
@@ -46,10 +48,22 @@ pub(crate) struct App {
     pub(crate) show_help: bool,
     /// The board's own state from the board service, or why it is missing.
     pub(crate) board: Option<BoardView>,
+    /// The last complete state, shown (as refreshing) while the service
+    /// reads the board again, so the screen does not jump.
+    pub(crate) last_known: Option<StateDto>,
+}
+
+/// Why the board state is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoardIssue {
+    /// No board service answers.
+    NotRunning,
+    /// Anything else, with the reason to show.
+    Other(String),
 }
 
 /// What the board service said: its state, or why it could not be asked.
-pub(crate) type BoardView = Result<crate::daemon::StateDto, String>;
+pub(crate) type BoardView = Result<StateDto, BoardIssue>;
 
 impl App {
     pub(crate) fn new(graph: Graph) -> Self {
@@ -61,7 +75,21 @@ impl App {
             message: None,
             show_help: false,
             board: None,
+            last_known: None,
         }
+    }
+
+    /// Records the board service's answer, keeping the last complete state
+    /// for as long as the board stays connected.
+    pub(crate) fn set_board(&mut self, view: BoardView) {
+        match &view {
+            Ok(state) if state.connected && state.state_known => {
+                self.last_known = Some(state.clone());
+            }
+            Ok(state) if state.connected => {}
+            _ => self.last_known = None,
+        }
+        self.board = Some(view);
     }
 
     /// Replaces the graph, keeping the selection on the same stream when it
