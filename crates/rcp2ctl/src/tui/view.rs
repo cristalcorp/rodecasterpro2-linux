@@ -199,7 +199,9 @@ fn keys_line(app: &App) -> Paragraph<'static> {
         Focus::Apps => "1-6 send app to output",
         Focus::Outputs => "Enter make default",
     };
-    let keys = format!("↑↓ select  {context}  Tab switch  o outputs  p persist  ? help  q quit");
+    let keys = format!(
+        "↑↓ select  {context}  Tab switch  o outputs  p persist  r restore  ? help  q quit"
+    );
     Paragraph::new(keys).style(Style::new().fg(Color::DarkGray))
 }
 
@@ -209,13 +211,14 @@ const HELP: &[(&str, &str)] = &[
     ("1 … 6", "send the selected application to that output"),
     ("Enter / d", "make the selected output the default"),
     ("o", "named outputs on / off"),
-    ("p", "keep outputs after reboot (config file) on / off"),
-    ("r", "refresh now"),
+    ("p", "keep outputs after reboot (install the config file)"),
+    ("r", "restore the original PipeWire configuration"),
+    ("F5", "refresh now (also automatic every second)"),
     ("q / Esc", "quit"),
 ];
 
 fn render_help(frame: &mut Frame<'_>) {
-    let area = centered(frame.area(), 70, 13);
+    let area = centered(frame.area(), 70, 14);
     let mut lines: Vec<Line<'_>> = HELP
         .iter()
         .map(|(key, what)| {
@@ -294,6 +297,6 @@ mod tests {
     fn help_overlays_the_screen() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
         app.show_help = true;
-        assert!(screen(&app).contains("keep outputs after reboot (config file) on / off"));
+        assert!(screen(&app).contains("restore the original PipeWire configuration"));
     }
 }

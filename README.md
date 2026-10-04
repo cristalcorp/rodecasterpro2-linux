@@ -53,7 +53,8 @@ target/release/rcp2ctl                     # interactive interface (TUI)
 
 In the TUI: `↑`/`↓` select an application, `1`–`6` send it to an output,
 `Tab` switches to the outputs panel where `Enter` makes one the system default,
-`o` turns the named outputs on/off, `p` toggles persistence, `?` shows help.
+`o` turns the named outputs on/off, `p` keeps them after a reboot (config file),
+`r` restores the original PipeWire configuration, `?` shows help.
 
 The same actions from the command line:
 

@@ -113,8 +113,6 @@ enum CliError {
     UninstallIncomplete(usize),
     #[error("the interactive interface needs a terminal; see `rcp2ctl --help` for commands")]
     NoTerminal,
-    #[error("cannot read whether persistence is on; nothing was changed")]
-    PersistStateUnknown,
     #[error("cannot write output: {0}")]
     Output(#[from] io::Error),
 }
