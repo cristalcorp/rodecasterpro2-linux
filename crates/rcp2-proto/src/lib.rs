@@ -16,6 +16,17 @@
 //! the only report-1 frame it can produce comes from [`ModeCommand`], which
 //! has a single variant.
 
+mod state;
+mod stream;
+mod tree;
+
+pub use state::{BoardState, ChannelState, InputSource};
+pub use stream::{
+    ACK_REPORT_ID, Change, DumpAssembler, DumpError, Incoming, PathNotFound, apply_property,
+    classify, decode_change,
+};
+pub use tree::{DecodeError, MAX_DEPTH, Node, Var, decode_tree, encode_tree};
+
 /// USB vendor ID of RØDE Microphones.
 pub const VENDOR_ID: u16 = 0x19F7;
 

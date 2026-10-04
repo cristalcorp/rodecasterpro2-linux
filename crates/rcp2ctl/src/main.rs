@@ -100,6 +100,12 @@ enum HidCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Decode a capture file offline and show what it says about the board
+    /// (firmware, channels, mutes, faders). Never prints the serial number.
+    Decode {
+        /// A `.rcp2cap` file written by `rcp2ctl hid capture`.
+        file: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -145,6 +151,10 @@ enum CliError {
         "capture files must end in `.{CAPTURE_EXTENSION}` (git ignores them: they hold the serial number)"
     )]
     CaptureExtension,
+    #[error("{0}: not a valid capture file (line {1})")]
+    BadCapture(PathBuf, usize),
+    #[error("the capture holds no complete state dump ({0})")]
+    NoDump(String),
     #[error("`sudo {0}` failed")]
     Sudo(String),
     #[error("{0} exists but was not written by rcp2ctl: left untouched")]
@@ -708,6 +718,7 @@ fn hid(command: HidCommand, out: &mut impl Write) -> Result<(), CliError> {
     let sys_class = Path::new(rcp2_hid::SYS_CLASS_HIDRAW);
     match command {
         HidCommand::Setup => hid_setup(out),
+        HidCommand::Decode { file } => hid_decode(&file, out),
         HidCommand::Find => {
             for path in rcp2_hid::find_devices(sys_class)? {
                 writeln!(out, "{}", path.display())?;
@@ -761,6 +772,84 @@ fn hid(command: HidCommand, out: &mut impl Write) -> Result<(), CliError> {
             summarise_capture(&reports, &file, out)
         }
     }
+}
+
+/// Reads the reports of a capture file (`<microseconds> <hex>` per line).
+fn read_capture(file: &Path) -> Result<Vec<Vec<u8>>, CliError> {
+    let text = std::fs::read_to_string(file).map_err(|source| PwError::Io {
+        path: file.to_owned(),
+        source,
+    })?;
+    let mut reports = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let bad = || CliError::BadCapture(file.to_owned(), number + 1);
+        let hex = line.split_whitespace().nth(1).ok_or_else(bad)?;
+        if hex.len() % 2 != 0 {
+            return Err(bad());
+        }
+        let report = (0..hex.len())
+            .step_by(2)
+            .map(|at| {
+                hex.get(at..at + 2)
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+            })
+            .collect::<Option<Vec<u8>>>()
+            .ok_or_else(bad)?;
+        reports.push(report);
+    }
+    Ok(reports)
+}
+
+fn hid_decode(file: &Path, out: &mut impl Write) -> Result<(), CliError> {
+    use rcp2_proto::{BoardState, DumpAssembler, Incoming, classify};
+    let reports = read_capture(file)?;
+    let mut assembler = DumpAssembler::default();
+    let (mut acks, mut changes, mut unknown) = (0, 0, 0);
+    let mut root = None;
+    for report in &reports {
+        match classify(report) {
+            Incoming::Ack => acks += 1,
+            Incoming::Change(_) => changes += 1,
+            Incoming::Unknown => unknown += 1,
+            Incoming::DumpChunk(chunk) => {
+                if let Some(tree) = assembler
+                    .push(chunk)
+                    .map_err(|err| CliError::NoDump(err.to_string()))?
+                {
+                    root.get_or_insert(tree);
+                }
+            }
+        }
+    }
+    let root = root.ok_or_else(|| CliError::NoDump("dump incomplete".to_owned()))?;
+    let state = BoardState::from_tree(&root);
+    writeln!(
+        out,
+        "{} report(s): {acks} acknowledgement(s), {changes} notification(s), {unknown} other",
+        reports.len()
+    )?;
+    writeln!(
+        out,
+        "Firmware: {}",
+        state.firmware.as_deref().unwrap_or("(not reported)")
+    )?;
+    writeln!(out, "Nodes under the root: {}", root.children.len())?;
+    writeln!(out, "Channels (tree index, source, output):")?;
+    for channel in &state.channels {
+        let output = match channel.muted {
+            Some(true) => "muted",
+            Some(false) => "on",
+            None => "?",
+        };
+        let source = channel.source.to_string();
+        writeln!(out, "  0x{:03x}  {source:<10}  {output}", channel.index)?;
+    }
+    let faders: Vec<String> = state.faders.iter().map(ToString::to_string).collect();
+    writeln!(out, "Faders (0-127): {}", faders.join(" "))?;
+    Ok(())
 }
 
 /// Runs `sudo <args>` in the terminal (it may ask for the password).
