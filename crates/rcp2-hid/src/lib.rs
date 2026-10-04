@@ -16,6 +16,40 @@ use rcp2_proto::{KNOWN_PRODUCT_IDS, ModeCommand, VENDOR_ID, session_open_report}
 /// Where the kernel lists `hidraw` devices.
 pub const SYS_CLASS_HIDRAW: &str = "/sys/class/hidraw";
 
+/// The udev rule giving the logged-in user access to the control interface,
+/// embedded so that `rcp2ctl hid setup` can install it without any file.
+pub const UDEV_RULE: &str = include_str!("../../../packaging/udev/70-rodecaster-pro-2.rules");
+
+/// Where `rcp2ctl hid setup` installs [`UDEV_RULE`].
+pub const UDEV_RULE_PATH: &str = "/etc/udev/rules.d/70-rodecaster-pro-2.rules";
+
+/// First line of every rule this project writes: how a file is recognised as ours.
+const UDEV_RULE_MARKER: &str = "# rodecasterpro2-linux:";
+
+/// State of the udev rule file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleState {
+    /// No file at the rule path.
+    Absent,
+    /// Our rule, identical to [`UDEV_RULE`].
+    UpToDate,
+    /// Our rule, from another version.
+    Outdated,
+    /// A file we did not write: never touched.
+    Foreign,
+}
+
+/// Classifies the contents of the rule path (`None`: no file).
+#[must_use]
+pub fn rule_state(contents: Option<&str>) -> RuleState {
+    match contents {
+        None => RuleState::Absent,
+        Some(text) if text == UDEV_RULE => RuleState::UpToDate,
+        Some(text) if text.starts_with(UDEV_RULE_MARKER) => RuleState::Outdated,
+        Some(_) => RuleState::Foreign,
+    }
+}
+
 /// Pause between the two handshake reports, as observed with RØDE's app.
 const HANDSHAKE_PAUSE: Duration = Duration::from_millis(200);
 
@@ -53,7 +87,7 @@ pub enum HidError {
 
 fn permission_hint(source: &io::Error) -> &'static str {
     if source.kind() == io::ErrorKind::PermissionDenied {
-        " (install the udev rule from packaging/udev, then replug the board)"
+        " (run `rcp2ctl hid setup` to give your user access)"
     } else {
         ""
     }
@@ -247,6 +281,23 @@ mod tests {
     use super::{find_device, find_devices, parse_hid_id};
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn recognises_our_rule_and_leaves_others_alone() {
+        use super::{RuleState, UDEV_RULE, rule_state};
+        assert!(UDEV_RULE.starts_with(super::UDEV_RULE_MARKER));
+        assert!(UDEV_RULE.contains("TAG+=\"uaccess\""));
+        assert_eq!(rule_state(None), RuleState::Absent);
+        assert_eq!(rule_state(Some(UDEV_RULE)), RuleState::UpToDate);
+        assert_eq!(
+            rule_state(Some("# rodecasterpro2-linux: older\n")),
+            RuleState::Outdated
+        );
+        assert_eq!(
+            rule_state(Some("SUBSYSTEM==\"hidraw\"\n")),
+            RuleState::Foreign
+        );
+    }
 
     #[test]
     fn parses_the_hid_id_line() {

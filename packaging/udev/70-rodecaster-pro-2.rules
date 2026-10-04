@@ -1,9 +1,8 @@
 # rodecasterpro2-linux: give the logged-in user access to the RØDECaster Pro II
 # control interface (hidraw), without root.
 #
-# Install:
-#   sudo install -m 644 70-rodecaster-pro-2.rules /etc/udev/rules.d/
-#   sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
+# Installed by `rcp2ctl hid setup`, removed by `rcp2ctl uninstall`. Packages
+# should ship it in /usr/lib/udev/rules.d/ instead.
 #
 # Only the product ID verified on hardware is listed; other modes or firmware
 # versions may use other IDs and are not trusted until checked.

@@ -83,6 +83,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum HidCommand {
+    /// Give your user access to the board's control interface (installs a udev
+    /// rule with sudo; `rcp2ctl uninstall` removes it).
+    Setup,
     /// Show which hidraw node is the board's control interface (opens nothing).
     Find,
     /// Handshake with the board and record what it sends (read-only), to study
@@ -139,6 +142,10 @@ enum CliError {
         "capture files must end in `.{CAPTURE_EXTENSION}` (git ignores them: they hold the serial number)"
     )]
     CaptureExtension,
+    #[error("`sudo {0}` failed")]
+    Sudo(String),
+    #[error("{0} exists but was not written by rcp2ctl: left untouched")]
+    ForeignRule(&'static str),
     #[error("cannot write output: {0}")]
     Output(#[from] io::Error),
 }
@@ -499,6 +506,22 @@ fn uninstall(yes: bool, keep_pipewire_config: bool, out: &mut impl Write) -> Res
         }
     }
 
+    // The udev rule from `rcp2ctl hid setup`, only if it is ours.
+    if matches!(
+        rcp2_hid::rule_state(read_rule().as_deref()),
+        rcp2_hid::RuleState::UpToDate | rcp2_hid::RuleState::Outdated
+    ) {
+        writeln!(
+            out,
+            "Removing {} (sudo may ask for your password).",
+            rcp2_hid::UDEV_RULE_PATH
+        )?;
+        match sudo(&["rm", "-f", rcp2_hid::UDEV_RULE_PATH]).and_then(|()| reload_udev()) {
+            Ok(()) => writeln!(out, "Board access rule removed.")?,
+            Err(err) => warn(out, format!("could not remove the udev rule: {err}"))?,
+        }
+    }
+
     match remove_runtime_outputs() {
         Ok(removed) => writeln!(
             out,
@@ -681,6 +704,7 @@ fn hid(command: HidCommand, out: &mut impl Write) -> Result<(), CliError> {
     use std::fmt::Write as _;
     let sys_class = Path::new(rcp2_hid::SYS_CLASS_HIDRAW);
     match command {
+        HidCommand::Setup => hid_setup(out),
         HidCommand::Find => {
             for path in rcp2_hid::find_devices(sys_class)? {
                 writeln!(out, "{}", path.display())?;
@@ -722,6 +746,72 @@ fn hid(command: HidCommand, out: &mut impl Write) -> Result<(), CliError> {
             summarise_capture(&reports, &file, out)
         }
     }
+}
+
+/// Runs `sudo <args>` in the terminal (it may ask for the password).
+fn sudo(args: &[&str]) -> Result<(), CliError> {
+    let shown = args.join(" ");
+    let status = std::process::Command::new("sudo")
+        .args(args)
+        .status()
+        .map_err(|_| CliError::Sudo(shown.clone()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::Sudo(shown))
+    }
+}
+
+fn read_rule() -> Option<String> {
+    std::fs::read_to_string(rcp2_hid::UDEV_RULE_PATH).ok()
+}
+
+/// Makes udev apply the rules again to the board, without replugging it.
+fn reload_udev() -> Result<(), CliError> {
+    sudo(&["udevadm", "control", "--reload"])?;
+    sudo(&[
+        "udevadm",
+        "trigger",
+        "--subsystem-match=hidraw",
+        "--action=change",
+    ])
+}
+
+fn hid_setup(out: &mut impl Write) -> Result<(), CliError> {
+    let dest = rcp2_hid::UDEV_RULE_PATH;
+    match rcp2_hid::rule_state(read_rule().as_deref()) {
+        rcp2_hid::RuleState::UpToDate => {
+            writeln!(out, "Access already set up ({dest}).")?;
+            return Ok(());
+        }
+        rcp2_hid::RuleState::Foreign => return Err(CliError::ForeignRule(dest)),
+        rcp2_hid::RuleState::Absent | rcp2_hid::RuleState::Outdated => {}
+    }
+    writeln!(
+        out,
+        "Installing {dest} so that your user can talk to the board (sudo may ask for your password)."
+    )?;
+    // A private temporary copy, then `install` sets owner and mode in one step.
+    let tmp = std::env::temp_dir().join(format!("rcp2ctl-udev-{}.rules", std::process::id()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(rcp2_hid::UDEV_RULE.as_bytes()))
+        .map_err(|source| PwError::Io {
+            path: tmp.clone(),
+            source,
+        })?;
+    let tmp_text = tmp.to_string_lossy().into_owned();
+    let installed = sudo(&["install", "-m", "644", &tmp_text, dest]);
+    let _ = std::fs::remove_file(&tmp);
+    installed?;
+    reload_udev()?;
+    writeln!(
+        out,
+        "Done: no replug needed. `rcp2ctl uninstall` removes it."
+    )?;
+    Ok(())
 }
 
 /// Counts only: the content holds the serial number and stays in the file.
