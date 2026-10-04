@@ -96,6 +96,9 @@ enum HidCommand {
         /// Stop after this many seconds at most.
         #[arg(long, default_value_t = 10)]
         seconds: u64,
+        /// Do not ask for confirmation (the faders still freeze until a replug).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -711,9 +714,21 @@ fn hid(command: HidCommand, out: &mut impl Write) -> Result<(), CliError> {
             }
             Ok(())
         }
-        HidCommand::Capture { file, seconds } => {
+        HidCommand::Capture { file, seconds, yes } => {
             if file.extension().and_then(|ext| ext.to_str()) != Some(CAPTURE_EXTENSION) {
                 return Err(CliError::CaptureExtension);
+            }
+            // Known effect on Linux (I-007): once subscribed, the board's faders
+            // stop working when nobody reads its HID interface, until a replug.
+            writeln!(
+                out,
+                "Warning: after this capture the board's faders stop controlling the volume \
+                 until you unplug and replug its USB cable (nothing is damaged). Do not run \
+                 it during a recording or a live show."
+            )?;
+            if !yes && !ask("Capture now?", false, out)? {
+                writeln!(out, "Nothing sent to the board.")?;
+                return Ok(());
             }
             // Create the file first: never handshake for nothing, never overwrite.
             let mut output = std::fs::OpenOptions::new()

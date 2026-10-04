@@ -1,113 +1,398 @@
 # rodecasterpro2-linux
 
-Linux control tool for the **RØDECaster Pro II**, written in Rust.
+A Linux tool, written in Rust, for the **RØDECaster Pro II**: named audio
+outputs ("RØDE Game", "RØDE Music"…), per-application routing, a terminal
+interface, and — in progress — reading the board's own state.
 
-> **Unofficial.** Not affiliated with, endorsed by, or supported by RØDE Microphones.
-> The control protocol is reverse-engineered and may break with any firmware update.
-> **Experimental: use at your own risk.**
+> **Unofficial.** This project is not affiliated with, endorsed by, or supported
+> by RØDE Microphones. The board's control protocol is reverse-engineered and may
+> change with any firmware update. Read [Risks](#5-risks) before using the board
+> control commands (`rcp2ctl hid …`).
 
-## Why
+## Contents
 
-On Linux the RØDECaster Pro II already works as a USB audio interface
-(`snd-usb-audio`), but nothing replaces RØDE Central / the RØDECaster app for
-everything else. This project aims to:
+1. [What it does](#1-what-it-does)
+2. [How it works](#2-how-it-works)
+3. [Requirements](#3-requirements)
+4. [Installation](#4-installation)
+5. [Risks](#5-risks)
+6. [First steps](#6-first-steps)
+7. [The terminal interface (TUI)](#7-the-terminal-interface-tui)
+8. [Command reference](#8-command-reference)
+9. [How the named outputs are kept](#9-how-the-named-outputs-are-kept)
+10. [Board control interface (HID)](#10-board-control-interface-hid)
+11. [Files and settings touched on your system](#11-files-and-settings-touched-on-your-system)
+12. [Uninstallation](#12-uninstallation)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Status and roadmap](#14-status-and-roadmap)
+15. [Development](#15-development)
+16. [Prior art and credits](#16-prior-art-and-credits)
+17. [License](#17-license)
 
-1. **Expose the board's USB outputs as named virtual devices** (e.g. *Game*,
-   *Music*, *Chat*) in PipeWire, and route each application to one of them.
-2. **Read and drive the board's faders and pots** for each input/output over the
-   vendor HID interface.
-3. Provide a **TUI** first, a GUI maybe later.
+## 1. What it does
 
-## Design principles
+On Linux the RØDECaster Pro II already works as a USB audio interface: the
+kernel's standard driver handles sound in both directions. What Linux lacks is
+everything RØDE's own apps do on Windows and macOS. This tool adds:
 
-- **Userspace only.** Audio stays in the kernel (`snd-usb-audio`); control goes
-  through `hidraw`. No kernel module.
-- **Hardware safety first.** Frames known to put the device into firmware update
-  mode or to flash it are not representable in the code. Writes are only ever sent
-  to object IDs observed in the device state, never discovered by sweeping.
-- **Strict Rust.** `unsafe_code = "forbid"` in our crates, clippy `pedantic` as
-  errors, no `unwrap`/`expect`/`panic` outside tests, `cargo-deny` in CI.
+- **Named outputs.** The board's USB playback channels appear as six separate
+  outputs — RØDE Chat, RØDE USB1, RØDE Game, RØDE Music, RØDE A and RØDE B —
+  each landing on the matching channel of the board. Send your game to "RØDE
+  Game" and your music player to "RØDE Music", and each one gets its own fader.
+- **Routing.** Move any application to any of these outputs, from the terminal
+  interface or the command line. The choice is remembered for the next time the
+  application starts.
+- **Default output.** Choose which output the system uses by default.
+- **A terminal interface** that shows all of the above at a glance.
+- **Board state (in progress).** Reading fader levels, mutes and channel
+  assignments from the board itself.
 
-## Workspace
+## 2. How it works
 
-| Crate | Role |
-|---|---|
-| `rcp2-proto` | Pure codec for the HID control protocol (no I/O, fuzzable) |
-| `rcp2-audio` | PipeWire side: board detection, named outputs (runtime or persistent), app routing |
-| `rcp2ctl` | TUI (no arguments) and command-line tool |
+- **Audio stays in the kernel.** The tool does not replace any driver. It works
+  in userspace only, on top of PipeWire, the standard Linux sound server.
+- **Named outputs** are small virtual outputs created inside PipeWire. Each one
+  forwards a stereo signal, unchanged, to one pair of the board's USB channels.
+- **The board's control interface** is a vendor-specific USB "HID" interface,
+  separate from the audio. The tool reads it through the standard Linux
+  `hidraw` device, without root once access is set up.
+- **No unsafe code, no C library.** The tool drives PipeWire through its own
+  command-line tools (`pw-dump`, `pw-metadata`, `pactl`, `wpctl`) and the board
+  through plain file reads and writes.
 
-## Status
+The board's USB channels, as verified on hardware (they may differ with other
+firmware versions):
 
-Named outputs, app routing, default output and a TUI work (PipeWire side).
-Nothing talks to the board's HID control interface yet.
+| Output | Board channel | PipeWire sink | Channels |
+|---|---|---|---|
+| RØDE Chat | Chat | `pro-output-0` (2 ch) | AUX0–AUX1 |
+| RØDE USB1 | USB 1 | `pro-output-1` (10 ch) | AUX0–AUX1 |
+| RØDE Game | Game | `pro-output-1` | AUX2–AUX3 |
+| RØDE Music | Music | `pro-output-1` | AUX4–AUX5 |
+| RØDE A | Virtual A | `pro-output-1` | AUX6–AUX7 |
+| RØDE B | Virtual B | `pro-output-1` | AUX8–AUX9 |
 
-## Usage
+Outputs are named after the board's channels, not its faders: on the board,
+any channel can be assigned to any fader.
 
-Requirements: PipeWire with WirePlumber and `pipewire-pulse` (`pactl`), and the
-board in the **Pro Audio** profile (pavucontrol, *Configuration* tab).
+## 3. Requirements
+
+- Linux with **PipeWire** and **WirePlumber**, and the PulseAudio compatibility
+  server **`pipewire-pulse`** (it provides `pactl`). These are the default on
+  most current distributions.
+- The board connected over USB, with the **Pro Audio** profile selected for it
+  (for example in pavucontrol, *Configuration* tab).
+- To build: a Rust toolchain (`rustup`); the exact version is pinned in
+  `rust-toolchain.toml` and installed automatically.
+- For board control only: `sudo`, once, to grant your user access to the board
+  (see [Board access](#101-board-access)).
+
+## 4. Installation
+
+There is no package yet. Build from source:
 
 ```sh
+git clone https://github.com/cristalcorp/rodecasterpro2-linux.git
+cd rodecasterpro2-linux
 cargo build --release
-target/release/rcp2ctl                     # interactive interface (TUI)
 ```
 
-In the TUI: `↑`/`↓` select an application, `1`–`6` send it to an output,
-`Tab` switches to the outputs panel where `Enter` makes one the system default,
-`o` turns the named outputs on/off, `p` keeps them after a reboot (config file),
-`r` restores the original PipeWire configuration, `?` shows help.
-
-The same actions from the command line:
+The result is a single binary, `target/release/rcp2ctl`. Copy it anywhere on
+your `PATH`, or install it into `~/.cargo/bin`:
 
 ```sh
-rcp2ctl status              # board + named outputs (creates them if missing)
-rcp2ctl apps                # who plays where
-rcp2ctl route firefox game  # remembered for the app's next runs
-rcp2ctl default usb1        # system default output (remembered by WirePlumber)
+cargo install --path crates/rcp2ctl --locked
 ```
 
-### How the named outputs are kept
+Nothing else is installed. The tool changes your system only when you run it,
+and only as described in [Files and settings touched](#11-files-and-settings-touched-on-your-system).
 
-- **By default, no file is touched.** Every launch of `rcp2ctl` creates the
-  missing outputs at runtime inside PipeWire. They last until PipeWire restarts
-  (e.g. a reboot) and come back the next time `rcp2ctl` runs. If `rcp2ctl` is
-  never launched, the system stays exactly as it was.
-- **`rcp2ctl persist on`** keeps them across reboots without launching
-  `rcp2ctl`, through a PipeWire config file. What was at that path before is
-  recorded first; **`rcp2ctl persist off`** restores it byte for byte. No
-  PipeWire restart is needed either way.
-- **`rcp2ctl outputs off|on`** removes or brings back the runtime outputs.
-- **`rcp2ctl uninstall`** undoes everything before you remove the binary. It
-  asks whether to restore the original PipeWire configuration (default: yes).
-  Removing the binary directly cannot ask anything, so run this first.
+## 5. Risks
 
-The application's own settings live in `~/.config/rodecasterpro2-linux/`, and
-the record of the original state in `~/.local/share/rodecasterpro2-linux/`.
+Read this before using the board control commands.
 
-The board's USB playback channels, as verified on hardware (firmware-dependent):
+**Audio features (outputs, routing, default output, TUI).** These only talk to
+PipeWire and never to the board's control interface. The worst case is that an
+application plays on another output than expected; everything is undone by
+`rcp2ctl uninstall`.
 
-| Output | Native sink | Channels |
+**Board control (`rcp2ctl hid …`).** The protocol is undocumented by RØDE and
+was reverse-engineered by the community. The tool is designed so that the known
+dangerous commands cannot be sent at all:
+
+- The only mode command it can build is "normal mode". The bytes that put the
+  board into firmware-update mode or start a firmware flash are not
+  representable in the code.
+- It never writes a setting to the board yet: today it only reads.
+- It never updates, sends or touches firmware.
+
+One effect is known and harmless, but you need to know about it:
+
+> **After a capture, the board's faders stop controlling the volume** until you
+> unplug and replug its USB cable. Nothing is damaged and no setting is lost.
+> The cause: once the tool has opened a session, the board keeps sending
+> notifications, and it freezes its controls when nobody reads them. On Windows
+> and macOS the system always reads them; on Linux it stops when the program
+> exits. A permanent fix is planned (see [Status and roadmap](#14-status-and-roadmap)).
+> Until then, **do not run a capture during a recording or a live show.**
+
+## 6. First steps
+
+1. Connect the board and select the **Pro Audio** profile for it.
+2. Run `rcp2ctl`. The named outputs appear immediately; nothing is written to
+   disk.
+3. Start some music, select the player in the list, and press `4` to send it to
+   RØDE Music.
+
+## 7. The terminal interface (TUI)
+
+Run `rcp2ctl` with no arguments. It needs a real terminal.
+
+The screen has a header (board, how the outputs are kept, default output), an
+**Outputs** panel on the left and an **Applications** panel on the right.
+
+- ★ marks the system's default output.
+- ♪ *n* shows how many applications play on an output.
+- "absent" means the named output does not exist right now.
+
+| Key | Action |
+|---|---|
+| `↑` `↓` or `j` `k` | Move the selection |
+| `Tab`, `←`, `→` | Switch between the two panels |
+| `1` … `6` | Send the selected application to that output (Applications panel) |
+| `Enter` or `d` | Make the selected output the system default (Outputs panel) |
+| `o` | Named outputs on / off |
+| `p` | Keep the outputs after a reboot (installs a PipeWire config file) |
+| `r` | Restore the original PipeWire configuration |
+| `F5` or `Ctrl+L` | Refresh now (the view also refreshes every second) |
+| `?` | Help |
+| `q`, `Esc` or `Ctrl+C` | Quit |
+
+Every action shows its result on the message line, including how to undo it.
+
+## 8. Command reference
+
+Every command also accepts `--help`. All of them, except `config`, the `hid`
+commands and `uninstall`, first recreate the named outputs if they are missing
+(see [How the named outputs are kept](#9-how-the-named-outputs-are-kept)).
+
+### `rcp2ctl`
+
+Opens the terminal interface. Refuses to start without a terminal.
+
+### `rcp2ctl status`
+
+Shows the board's PipeWire sinks, whether each named output is present, and how
+the outputs are kept (created at each launch, kept by the config file, or off).
+
+### `rcp2ctl apps`
+
+Lists the applications playing audio: stream ID, process binary, application
+name, output and what is playing. Several applications can share a binary (Wine
+games, Electron apps): use the stream ID to target exactly one.
+
+### `rcp2ctl route <app> <output>`
+
+Sends an application to a named output. `<app>` is a stream ID, a process
+binary or an application name, exactly as listed by `apps` (case-insensitive,
+no partial matches); every matching stream is moved. `<output>` is one of
+`chat`, `usb1`, `game`, `music`, `a`, `b`. WirePlumber remembers the choice for
+the application's next runs.
+
+```sh
+rcp2ctl route firefox game
+rcp2ctl route 320 music
+```
+
+### `rcp2ctl default <output>`
+
+Makes a named output the system's default output. WirePlumber remembers it.
+
+### `rcp2ctl outputs on|off`
+
+`on` creates the named outputs now and at every launch (the default). `off`
+removes them; applications playing on them move to the default output. Refused
+while persistence is on: turn persistence off first.
+
+### `rcp2ctl persist on|off`
+
+`on` keeps the named outputs after a reboot, even if `rcp2ctl` is never run
+again, by installing a PipeWire config file. What was at that path before (a
+file, or nothing) is recorded first. `off` restores exactly that original
+state. No PipeWire restart is needed either way.
+
+### `rcp2ctl config`
+
+Prints the PipeWire configuration that `persist on` installs, without
+installing anything. Useful for packagers.
+
+### `rcp2ctl hid setup`
+
+Grants your user access to the board's control interface by installing a udev
+rule (asks for your `sudo` password). See [Board access](#101-board-access).
+
+### `rcp2ctl hid find`
+
+Prints the board's `hidraw` device. Opens nothing.
+
+### `rcp2ctl hid capture <file>.rcp2cap [--seconds N] [--yes]`
+
+Opens a session with the board and records what it sends, to study the
+protocol. Read-only. **Asks for confirmation** because of the fader freeze
+described in [Risks](#5-risks); `--yes` skips the question. Stops after the
+initial state dump, or after `N` seconds (default 10). The file must end in
+`.rcp2cap` and is never overwritten. It contains the board's serial number:
+keep it private (git ignores this extension).
+
+### `rcp2ctl uninstall [--yes | --keep-pipewire-config]`
+
+Undoes everything the tool did. See [Uninstallation](#12-uninstallation).
+
+## 9. How the named outputs are kept
+
+- **By default, no file is written.** Every time `rcp2ctl` runs, it re-reads
+  its own settings and creates any missing named outputs inside PipeWire. They
+  last until PipeWire restarts (for example at a reboot), even after `rcp2ctl`
+  exits. If `rcp2ctl` is never run again, or crashes, your system is exactly as
+  it was after the next reboot.
+- **Persistence (`persist on`, or `p` in the TUI)** keeps them across reboots
+  through a PipeWire config file. Before writing it, the tool records what was
+  at that path, with its permissions. **`persist off` (or `r`) puts it back
+  byte for byte**, even if the generated file was deleted by hand in between.
+- **Files the tool did not write are never overwritten**, and symbolic links
+  (dotfiles managers, Nix) are never followed or replaced: the tool stops and
+  tells you.
+
+## 10. Board control interface (HID)
+
+### 10.1 Board access
+
+The board's control interface (`/dev/hidrawN`) is readable only by root by
+default. `rcp2ctl hid setup` installs a udev rule, embedded in the binary, that
+gives the **logged-in user** access to this one device, then applies it at
+once (no replug). It does nothing if the rule is already installed and never
+replaces a file it did not write. `rcp2ctl uninstall` removes it.
+
+Distribution packages should ship `packaging/udev/70-rodecaster-pro-2.rules` in
+`/usr/lib/udev/rules.d/` instead.
+
+### 10.2 What is read
+
+The board answers a session request with a dump of its whole state (about
+90 KB): channels and their sources, faders, mutes, processing, pads, system
+settings. The tool decodes it exactly (it is a JUCE `ValueTree`). Verified on
+firmware 1.6.8: fader positions and mute states match the board.
+
+### 10.3 What is never done
+
+- Sending any mode byte other than "normal mode".
+- Writing settings that were not read from the board first, or guessing setting
+  addresses.
+- Writing fader levels: the faders are physical and not motorised; the board
+  refuses it by design.
+- Anything related to firmware updates.
+
+## 11. Files and settings touched on your system
+
+| What | When | Undone by |
 |---|---|---|
-| RØDE Chat | `pro-output-0` (2 ch) | AUX0–AUX1 |
-| RØDE USB1 | `pro-output-1` (10 ch) | AUX0–AUX1 |
-| RØDE Game | `pro-output-1` | AUX2–AUX3 |
-| RØDE Music | `pro-output-1` | AUX4–AUX5 |
-| RØDE A | `pro-output-1` | AUX6–AUX7 |
-| RØDE B | `pro-output-1` | AUX8–AUX9 |
+| Named outputs inside PipeWire (in memory, no file) | Every run, if outputs are on | `outputs off`, a PipeWire restart, `uninstall` |
+| `~/.config/rodecasterpro2-linux/config.toml` (the tool's settings) | `outputs on/off` | `uninstall` |
+| `~/.config/pipewire/pipewire.conf.d/50-rodecaster-virtual-sinks.conf` | `persist on` | `persist off`, `uninstall` |
+| `~/.local/share/rodecasterpro2-linux/original/` (record of the original) | `persist on` | `persist off`, `uninstall` |
+| Per-application output memory, default output (WirePlumber state) | `route`, `default` | your desktop's sound settings |
+| `/etc/udev/rules.d/70-rodecaster-pro-2.rules` | `hid setup` | `uninstall` |
+| Your `.rcp2cap` capture files | `hid capture` | delete them yourself |
 
-Outputs are named after the board's channels, not its faders: any channel can be
-assigned to any fader on the board.
+## 12. Uninstallation
 
+Run this **before** removing the binary; removing the binary alone cannot undo
+anything.
 
-## Prior art and credits
+```sh
+rcp2ctl uninstall
+```
 
-- [seanheiney/rodey](https://github.com/seanheiney/rodey): the reference write-up of
-  the HID protocol ([PROTOCOL.md](https://github.com/seanheiney/rodey/blob/main/docs/PROTOCOL.md)).
+It:
+
+1. Asks **"Restore the original PipeWire configuration?"** if persistence was
+   on. The default answer is yes (also without a terminal). `--yes` restores
+   without asking; `--keep-pipewire-config` keeps the file without asking.
+2. Removes the board access rule, if `hid setup` installed it (asks for your
+   `sudo` password).
+3. Removes the named outputs created at runtime.
+4. Removes the tool's settings.
+5. Tells you where the binary is, so you can delete it.
+
+Every step runs even if a previous one fails; problems are listed and the
+command exits with an error. Files changed by hand and symbolic links are left
+in place, with a message.
+
+Then delete the binary (`cargo uninstall rcp2ctl` if installed with
+`cargo install`). WirePlumber's per-application memory can be reset from your
+desktop's sound settings.
+
+## 13. Troubleshooting
+
+**"no RØDECaster Pro II found"** — Check the USB cable, that the board is on,
+and that `pactl list short sinks` shows it.
+
+**"has no `pro-output-1` sink"** — Select the **Pro Audio** profile for the
+board (pavucontrol, *Configuration* tab).
+
+**The named outputs are missing after a reboot** — Expected without
+persistence: run `rcp2ctl` once, or turn persistence on.
+
+**The faders no longer change the volume** — A capture was run (see
+[Risks](#5-risks)). Unplug and replug the board's USB cable.
+
+**"Permission denied" on `/dev/hidrawN`** — Run `rcp2ctl hid setup`.
+
+**"… is a symlink" or "… was changed outside rcp2ctl"** — The tool refuses to
+touch a file it does not own. Review the file, then move it away and rerun.
+
+**"the interactive interface needs a terminal"** — `rcp2ctl` without arguments
+opens the TUI; in scripts, use the commands from the reference.
+
+## 14. Status and roadmap
+
+| Area | State |
+|---|---|
+| Named outputs, routing, default output | Done |
+| Terminal interface | Done (audio side) |
+| Reading the board's state | In progress: exact decoder validated on a capture |
+| Permanent fix for the fader freeze | Planned: a small user service owning the board session |
+| Live fader levels in the TUI | Planned (faders send no live notification; MIDI is being evaluated) |
+| Writing board settings (mutes, gain, processing) | Later, one setting type at a time, each tested on hardware first |
+
+## 15. Development
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+- Workspace: `rcp2-proto` (pure protocol codec, no I/O), `rcp2-hid` (`hidraw`
+  transport), `rcp2-audio` (PipeWire side), `rcp2ctl` (TUI and CLI).
+- Strict rules: `unsafe` forbidden, clippy `pedantic` as errors, no
+  `unwrap`/`expect`/`panic` outside tests, `cargo-deny` and secret scanning in
+  CI, protected `main`, every change through a reviewed pull request.
+- The decoder is tested without hardware, on anonymised fixtures. Captures of
+  real boards contain serial numbers and never go into the repository.
+
+## 16. Prior art and credits
+
+- [seanheiney/rodey](https://github.com/seanheiney/rodey) (MIT): the reference
+  write-up of the HID protocol.
+- [AccessCaster's protocol findings](https://github.com/parzival-space/rodecaster-utility/issues/11)
+  (facts only; no code from GPL projects is used).
 - Other community projects: [x1h0/rcp2-cli](https://github.com/x1h0/rcp2-cli),
   [Holfz/rodecaster-routing](https://github.com/Holfz/rodecaster-routing),
   [parzival-space/rodecaster-utility](https://github.com/parzival-space/rodecaster-utility),
   [Jordan-Milner/rodecaster-pro2-pipewire](https://github.com/Jordan-Milner/rodecaster-pro2-pipewire).
 
-## License
+## 17. License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT), at your option.
