@@ -11,14 +11,13 @@ use std::io::{self, BufRead as _, BufReader, Read as _, Write};
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rcp2_proto::{
-    BoardState, Change, DumpAssembler, Incoming, InputSource, Node, apply_property, classify,
-};
+use rcp2_proto::{BoardState, Change, DumpAssembler, Incoming, Node, apply_property, classify};
 use serde::{Deserialize, Serialize};
 
 /// Socket file name inside the runtime directory.
@@ -31,6 +30,15 @@ const MAX_REQUEST: u64 = 256;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Version of the socket protocol.
 const PROTOCOL_VERSION: u32 = 1;
+/// Least time between two requests for a new dump.
+const RESYNC_EVERY: Duration = Duration::from_secs(5);
+/// Notifications kept while waiting for a dump; beyond that, a new dump is
+/// needed anyway.
+const MAX_PENDING: usize = 1024;
+/// Clients served at the same time.
+const MAX_CLIENTS: usize = 8;
+/// Pause after a failed `accept`, so a persistent error cannot spin.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(200);
 
 /// Error of the service or of a client of it.
 #[derive(Debug, thiserror::Error)]
@@ -77,8 +85,10 @@ pub(crate) struct ChannelDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StateDto {
     pub(crate) version: u32,
-    /// The board is connected and its state is known.
+    /// A session with the board is open.
     pub(crate) connected: bool,
+    /// The board's state is known (false while the first or a new dump is read).
+    pub(crate) state_known: bool,
     pub(crate) firmware: Option<String>,
     pub(crate) channels: Vec<ChannelDto>,
     pub(crate) faders: Vec<i32>,
@@ -87,18 +97,19 @@ pub(crate) struct StateDto {
 }
 
 impl StateDto {
-    fn from_tree(tree: Option<&Node>, notifications: u64) -> Self {
+    fn new(connected: bool, tree: Option<&Node>, notifications: u64) -> Self {
         let state = tree.map(BoardState::from_tree).unwrap_or_default();
         Self {
             version: PROTOCOL_VERSION,
-            connected: tree.is_some(),
+            connected,
+            state_known: tree.is_some(),
             firmware: state.firmware,
             channels: state
                 .channels
                 .iter()
                 .map(|channel| ChannelDto {
                     index: channel.index,
-                    source: source_label(channel.source),
+                    source: channel.source.to_string(),
                     muted: channel.muted,
                 })
                 .collect(),
@@ -108,13 +119,10 @@ impl StateDto {
     }
 }
 
-fn source_label(source: InputSource) -> String {
-    source.to_string()
-}
-
 /// What the session thread shares with the socket server.
 #[derive(Default)]
 struct Shared {
+    connected: bool,
     tree: Option<Node>,
     notifications: u64,
 }
@@ -147,11 +155,9 @@ pub(crate) fn run(log: &mut impl Write) -> Result<(), DaemonError> {
         }) {
             Ok((path, board)) => {
                 let _ = writeln!(log, "board found at {}: opening a session", path.display());
-                let reason = session(board, &shared);
+                let reason = session(board, &shared, log);
                 let _ = writeln!(log, "session ended: {reason}");
-                let mut state = lock(&shared);
-                state.tree = None;
-                state.notifications = 0;
+                *lock(&shared) = Shared::default();
             }
             Err(rcp2_hid::HidError::NotFound) => {}
             Err(err) => {
@@ -182,89 +188,153 @@ fn bind(path: &Path) -> Result<UnixListener, DaemonError> {
 }
 
 /// One session with the board, until it is unplugged or a read fails.
-fn session(mut board: rcp2_hid::Board, shared: &SharedState) -> String {
+fn session(mut board: rcp2_hid::Board, shared: &SharedState, log: &mut impl Write) -> String {
     let reports = match board.reports(Instant::now()) {
         Ok(reports) => reports,
         Err(err) => return err.to_string(),
     };
-    if let Err(err) = board.handshake() {
+    let mut sync = Tracker::default();
+    if let Err(err) = sync.request(&mut board) {
         return err.to_string();
     }
-    follow(&reports, &mut board, shared)
+    lock(shared).connected = true;
+    loop {
+        let report = match reports.recv_timeout(RESYNC_EVERY) {
+            Ok(Ok(report)) => Some(report),
+            Ok(Err(err)) => return format!("read error: {err}"),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return "reader stopped".to_owned(),
+        };
+        let needs_resync = match report {
+            Some(report) => sync.handle(&report.bytes, shared),
+            // Quiet board: only a problem if a dump was asked for and never came.
+            None => lock(shared).tree.is_none(),
+        };
+        if needs_resync && sync.may_request() {
+            let _ = writeln!(
+                log,
+                "state copy out of date: asking the board for a new dump"
+            );
+            lock(shared).tree = None;
+            if let Err(err) = sync.request(&mut board) {
+                return err.to_string();
+            }
+        }
+    }
 }
 
-/// Reads reports forever: assembles dumps, applies notifications.
-fn follow(
-    reports: &Receiver<io::Result<rcp2_hid::Report>>,
-    board: &mut rcp2_hid::Board,
-    shared: &SharedState,
-) -> String {
-    let mut assembler = DumpAssembler::default();
-    // Notifications that arrive while a dump is being assembled.
-    let mut pending: Vec<Change> = Vec::new();
-    loop {
-        let report = match reports.recv() {
-            Ok(Ok(report)) => report,
-            Ok(Err(err)) => return format!("read error: {err}"),
-            Err(_) => return "reader stopped".to_owned(),
-        };
-        match classify(&report.bytes) {
-            Incoming::DumpChunk(chunk) => match assembler.push(chunk) {
+/// Keeps the copy of the board state in step with the board.
+#[derive(Default)]
+struct Tracker {
+    assembler: DumpAssembler,
+    /// Property changes received while no complete dump is available.
+    pending: Vec<Change>,
+    last_request: Option<Instant>,
+}
+
+impl Tracker {
+    /// Asks for a full dump (the handshake), forgetting partial data.
+    fn request(&mut self, board: &mut rcp2_hid::Board) -> Result<(), rcp2_hid::HidError> {
+        self.assembler = DumpAssembler::default();
+        self.pending.clear();
+        self.last_request = Some(Instant::now());
+        board.handshake()
+    }
+
+    /// Rate limit: at most one request every [`RESYNC_EVERY`].
+    fn may_request(&self) -> bool {
+        self.last_request
+            .is_none_or(|last| last.elapsed() >= RESYNC_EVERY)
+    }
+
+    /// Handles one report; `true` if the copy is out of date.
+    fn handle(&mut self, report: &[u8], shared: &SharedState) -> bool {
+        match classify(report) {
+            Incoming::DumpChunk(chunk) => match self.assembler.push(chunk) {
                 Ok(Some(mut tree)) => {
                     let mut applied = 0;
-                    for change in pending.drain(..) {
+                    let mut fits = true;
+                    for change in self.pending.drain(..) {
                         if apply(&mut tree, change) {
                             applied += 1;
+                        } else {
+                            fits = false;
                         }
                     }
                     let mut state = lock(shared);
                     state.tree = Some(tree);
                     state.notifications = applied;
+                    !fits
                 }
-                Ok(None) => {}
-                Err(_) => assembler = DumpAssembler::default(),
+                Ok(None) => false,
+                // A chunk that belongs to no dump: our view of the stream is off.
+                Err(_) => {
+                    self.assembler = DumpAssembler::default();
+                    true
+                }
             },
             Incoming::Change(change) => {
-                if assembler.missing().is_some() {
-                    pending.push(change);
-                    continue;
-                }
                 let mut state = lock(shared);
-                let Some(tree) = state.tree.as_mut() else {
-                    pending.push(change);
-                    continue;
-                };
-                if apply(tree, change) {
-                    state.notifications += 1;
-                } else {
-                    // Our copy no longer matches the board: ask for a new dump.
-                    state.tree = None;
-                    drop(state);
-                    if let Err(err) = board.handshake() {
-                        return err.to_string();
+                match state.tree.as_mut() {
+                    Some(tree) if self.assembler.missing().is_none() => {
+                        if apply(tree, change) {
+                            state.notifications += 1;
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    _ => {
+                        drop(state);
+                        if self.pending.len() >= MAX_PENDING {
+                            self.pending.clear();
+                            return true;
+                        }
+                        self.pending.push(change);
+                        false
                     }
                 }
             }
-            Incoming::Ack | Incoming::Unknown => {}
+            Incoming::Ack | Incoming::Unknown => false,
         }
     }
 }
 
-/// Applies a property change; `false` if the copy is out of date.
+/// Applies a change; `false` if the copy is out of date and needs a new dump
+/// (changes to the tree's shape are not applied, they always need one).
 fn apply(tree: &mut Node, change: Change) -> bool {
     match change {
         Change::PropertyChanged { path, name, value } => {
             apply_property(tree, &path, &name, value).is_ok()
         }
-        Change::FullSync(_) | Change::Other { .. } => true,
+        Change::FullSync(new_tree) => {
+            *tree = new_tree;
+            true
+        }
+        Change::Structural { .. } => false,
     }
 }
 
-/// Answers clients, one request per connection.
+/// Answers clients, one request per connection, each on its own thread (up
+/// to [`MAX_CLIENTS`] at once), so a slow client cannot block the others.
 fn serve(listener: &UnixListener, shared: &SharedState) {
-    for stream in listener.incoming().flatten() {
-        // A misbehaving client only affects its own connection.
-        let _ = answer(stream, shared);
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else {
+            thread::sleep(ACCEPT_BACKOFF);
+            continue;
+        };
+        if active.fetch_add(1, Ordering::SeqCst) >= MAX_CLIENTS {
+            active.fetch_sub(1, Ordering::SeqCst);
+            continue;
+        }
+        let shared = Arc::clone(shared);
+        let active = Arc::clone(&active);
+        thread::spawn(move || {
+            // A misbehaving client only affects its own connection.
+            let _ = answer(stream, &shared);
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 }
 
@@ -279,7 +349,7 @@ fn answer(stream: UnixStream, shared: &SharedState) -> io::Result<()> {
     }
     let answer = {
         let state = lock(shared);
-        StateDto::from_tree(state.tree.as_ref(), state.notifications)
+        StateDto::new(state.connected, state.tree.as_ref(), state.notifications)
     };
     let json = serde_json::to_string(&answer).map_err(io::Error::other)?;
     writeln!(stream, "{json}")
@@ -311,6 +381,16 @@ mod tests {
     use rcp2_proto::{Change, Node, Var};
 
     #[test]
+    fn shape_changes_always_need_a_new_dump() {
+        let mut tree = Node::default();
+        let change = Change::Structural {
+            kind: 3,
+            path: vec![],
+        };
+        assert!(!apply(&mut tree, change));
+    }
+
+    #[test]
     fn a_change_outside_the_tree_marks_the_copy_out_of_date() {
         let mut tree = Node::default();
         let change = Change::PropertyChanged {
@@ -322,9 +402,10 @@ mod tests {
     }
 
     #[test]
-    fn without_a_tree_the_board_is_reported_disconnected() {
-        let state = StateDto::from_tree(None, 0);
-        assert!(!state.connected);
+    fn a_session_without_a_tree_is_connected_but_unknown() {
+        let state = StateDto::new(true, None, 0);
+        assert!(state.connected);
+        assert!(!state.state_known);
         assert!(state.channels.is_empty());
         let json = serde_json::to_string(&state).unwrap();
         assert_eq!(serde_json::from_str::<StateDto>(&json).unwrap(), state);

@@ -20,6 +20,10 @@ pub const ACK_REPORT_ID: u8 = 2;
 /// JUCE `ValueTreeSynchroniser` change types.
 const CHANGE_PROPERTY: u8 = 1;
 const CHANGE_FULL_SYNC: u8 = 2;
+const CHANGE_CHILD_ADDED: u8 = 3;
+const CHANGE_CHILD_REMOVED: u8 = 4;
+const CHANGE_CHILD_MOVED: u8 = 5;
+const CHANGE_PROPERTY_REMOVED: u8 = 6;
 
 /// Largest state dump accepted, well above the ~150 KB of a real board.
 const MAX_DUMP_LEN: usize = 4 << 20;
@@ -38,11 +42,24 @@ pub enum Change {
     },
     /// The whole tree.
     FullSync(Node),
-    /// Another change type (child added, removed, moved…), kept undecoded.
-    Other {
-        /// The change type byte.
+    /// The shape of the tree changed under the node at `path` (child added,
+    /// removed or moved, property removed). Fully decoded, not applied: a
+    /// local copy must be refreshed with a new dump.
+    Structural {
+        /// The change type byte (3 to 6).
         kind: u8,
+        /// Path of the node whose children or properties changed.
+        path: Vec<usize>,
     },
+}
+
+fn read_path(reader: &mut Reader<'_>) -> Result<Vec<usize>, DecodeError> {
+    let depth = reader.count()?;
+    let mut path = Vec::with_capacity(depth.min(reader.remaining()));
+    for _ in 0..depth {
+        path.push(reader.count()?);
+    }
+    Ok(path)
 }
 
 /// Decodes one complete message.
@@ -52,23 +69,40 @@ pub enum Change {
 /// Returns [`DecodeError`] if the message is malformed or has trailing bytes.
 pub fn decode_change(message: &[u8]) -> Result<Change, DecodeError> {
     let (&kind, rest) = message.split_first().ok_or(DecodeError::Truncated(0))?;
-    match kind {
+    if kind == CHANGE_FULL_SYNC {
+        return Ok(Change::FullSync(decode_tree(rest)?));
+    }
+    let mut reader = Reader::new(rest);
+    let path = read_path(&mut reader)?;
+    let change = match kind {
         CHANGE_PROPERTY => {
-            let mut reader = Reader::new(rest);
-            let depth = reader.count()?;
-            let mut path = Vec::with_capacity(depth.min(reader.remaining()));
-            for _ in 0..depth {
-                path.push(reader.count()?);
-            }
             let name = reader.string()?;
             let value = reader.var()?;
-            match reader.remaining() {
-                0 => Ok(Change::PropertyChanged { path, name, value }),
-                extra => Err(DecodeError::Trailing(extra)),
-            }
+            Change::PropertyChanged { path, name, value }
         }
-        CHANGE_FULL_SYNC => Ok(Change::FullSync(decode_tree(rest)?)),
-        kind => Ok(Change::Other { kind }),
+        CHANGE_CHILD_ADDED => {
+            reader.int()?;
+            reader.node(0)?;
+            Change::Structural { kind, path }
+        }
+        CHANGE_CHILD_REMOVED => {
+            reader.int()?;
+            Change::Structural { kind, path }
+        }
+        CHANGE_CHILD_MOVED => {
+            reader.int()?;
+            reader.int()?;
+            Change::Structural { kind, path }
+        }
+        CHANGE_PROPERTY_REMOVED => {
+            reader.string()?;
+            Change::Structural { kind, path }
+        }
+        other => return Err(DecodeError::UnknownChange(other)),
+    };
+    match reader.remaining() {
+        0 => Ok(change),
+        extra => Err(DecodeError::Trailing(extra)),
     }
 }
 
@@ -112,11 +146,11 @@ fn notification(data: &[u8]) -> Option<Change> {
     if len == 0 || padding.iter().any(|byte| *byte != 0) {
         return None;
     }
-    // Only fully decoded property changes count: any other shape (including
-    // the zero-padded last chunk of a dump) is treated as dump data.
+    // Only fully decoded messages count: any other shape (including the
+    // zero-padded last chunk of a dump) is treated as dump data.
     match decode_change(message).ok()? {
-        change @ Change::PropertyChanged { .. } => Some(change),
-        Change::FullSync(_) | Change::Other { .. } => None,
+        Change::FullSync(_) => None,
+        change => Some(change),
     }
 }
 
@@ -188,7 +222,7 @@ impl DumpAssembler {
         match decode_change(message)? {
             Change::FullSync(root) => Ok(Some(root)),
             Change::PropertyChanged { .. } => Err(DumpError::NotFullSync(CHANGE_PROPERTY)),
-            Change::Other { kind } => Err(DumpError::NotFullSync(kind)),
+            Change::Structural { kind, .. } => Err(DumpError::NotFullSync(kind)),
         }
     }
 }
@@ -348,6 +382,45 @@ mod tests {
         report.extend([0x41; 41]);
         report.resize(256, 0);
         assert!(matches!(classify(&report), Incoming::DumpChunk(_)));
+    }
+
+    #[test]
+    fn structural_changes_are_recognised_and_unknown_types_rejected() {
+        // Child 2 removed from the node at path [5].
+        let removed = [4, 0x01, 0x01, 0x01, 0x05, 0x01, 0x02];
+        assert_eq!(
+            classify(&notification_report(&removed)),
+            Incoming::Change(Change::Structural {
+                kind: 4,
+                path: vec![5]
+            })
+        );
+        // Child moved from 1 to 3 at the root.
+        assert_eq!(
+            decode_change(&[5, 0x00, 0x01, 0x01, 0x01, 0x03]),
+            Ok(Change::Structural {
+                kind: 5,
+                path: vec![]
+            })
+        );
+        // Child added: index then a whole node.
+        let mut added = vec![3, 0x00, 0x01, 0x00];
+        added.extend(encode_tree(&Node {
+            name: "PAD".to_owned(),
+            ..Node::default()
+        }));
+        assert_eq!(
+            decode_change(&added),
+            Ok(Change::Structural {
+                kind: 3,
+                path: vec![]
+            })
+        );
+        assert!(decode_change(&[9, 0x00]).is_err());
+        assert!(
+            decode_change(&[4, 0x00, 0x01, 0x02, 0xFF]).is_err(),
+            "trailing byte"
+        );
     }
 
     #[test]

@@ -104,6 +104,9 @@ pub enum DecodeError {
     /// Bytes remain after the root node.
     #[error("{0} unexpected trailing bytes")]
     Trailing(usize),
+    /// A message of a change type this decoder does not know.
+    #[error("unknown change type {0}")]
+    UnknownChange(u8),
 }
 
 /// A cursor over the input, with bounds checks on every read.
@@ -212,7 +215,7 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn node(&mut self, depth: usize) -> Result<Node, DecodeError> {
+    pub(crate) fn node(&mut self, depth: usize) -> Result<Node, DecodeError> {
         if depth > MAX_DEPTH {
             return Err(DecodeError::TooDeep);
         }

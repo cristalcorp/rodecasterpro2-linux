@@ -1,11 +1,10 @@
 //! The systemd user unit running `rcp2ctl daemon` (no root).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use rcp2_audio::{config_home, write_atomically};
 
-use crate::CliError;
+use crate::{CliError, run_command};
 
 /// Unit name, also the file name under `~/.config/systemd/user/`.
 pub(crate) const UNIT_NAME: &str = "rodecasterpro2-linux.service";
@@ -29,6 +28,17 @@ pub(crate) fn unit_text(exe: &Path) -> String {
          ExecStart=\"{}\" daemon\n\
          Restart=on-failure\n\
          RestartSec=2\n\
+         # Least privilege: it only reads a device file and serves a local socket.\n\
+         NoNewPrivileges=yes\n\
+         LockPersonality=yes\n\
+         MemoryDenyWriteExecute=yes\n\
+         RestrictRealtime=yes\n\
+         RestrictSUIDSGID=yes\n\
+         RestrictAddressFamilies=AF_UNIX\n\
+         SystemCallArchitectures=native\n\
+         SystemCallFilter=@system-service\n\
+         SystemCallFilter=~@privileged @resources\n\
+         UMask=0077\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
@@ -58,24 +68,19 @@ pub(crate) fn unit_state(path: &Path) -> Result<UnitState, CliError> {
 
 /// Runs `systemctl --user <args>`.
 fn systemctl(args: &[&str]) -> Result<(), CliError> {
-    let shown = format!("systemctl --user {}", args.join(" "));
-    let status = Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .status()
-        .map_err(|_| CliError::Systemctl(shown.clone()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(CliError::Systemctl(shown))
-    }
+    let mut all = vec!["--user"];
+    all.extend_from_slice(args);
+    run_command("systemctl", &all)
 }
 
 /// Writes (or updates) the unit for `exe` and starts it now and at login.
 pub(crate) fn install(exe: &Path) -> Result<PathBuf, CliError> {
-    // Quotes, `%` and line breaks mean something to systemd: refuse them.
-    let text = exe.to_string_lossy();
-    if text.contains(['"', '%', '\\', '\n']) {
+    // Quotes, `%`, `$`, backslashes and line breaks mean something to
+    // systemd, and a non-UTF-8 path cannot be written as is: refuse them.
+    let safe = exe
+        .to_str()
+        .is_some_and(|text| !text.contains(['"', '%', '$', '\\', '\n']));
+    if !safe {
         return Err(CliError::UnsafeExePath(exe.to_owned()));
     }
     let path = unit_path()?;
@@ -84,8 +89,8 @@ pub(crate) fn install(exe: &Path) -> Result<PathBuf, CliError> {
     }
     write_atomically(&path, unit_text(exe).as_bytes())?;
     systemctl(&["daemon-reload"])?;
-    systemctl(&["enable", "--now", UNIT_NAME])?;
-    // Picks up a new binary path if the unit was already running.
+    systemctl(&["enable", UNIT_NAME])?;
+    // Starts it, or restarts it on a new binary path: a single start either way.
     systemctl(&["restart", UNIT_NAME])?;
     Ok(path)
 }
@@ -116,5 +121,7 @@ mod tests {
         assert!(text.starts_with(UNIT_MARKER));
         assert!(text.contains("ExecStart=\"/home/u/.cargo/bin/rcp2ctl\" daemon\n"));
         assert!(text.contains("WantedBy=default.target"));
+        assert!(text.contains("NoNewPrivileges=yes"));
+        assert!(text.contains("RestrictAddressFamilies=AF_UNIX\n"));
     }
 }
