@@ -411,6 +411,11 @@ reset (`usbreset`) does not help.
 so nothing read the board any more. Unplug it; next time, turn the board off
 before the computer.
 
+**An application shows it is playing but nothing comes out, after PipeWire
+was restarted** — Some applications do not reconnect to PipeWire on their own
+(seen with qbz): quit and start the application again. WirePlumber still
+remembers its output.
+
 **The named outputs disappeared after unplugging the board** — The board
 service recreates them when it is back. Without the service, run `rcp2ctl`
 once.
