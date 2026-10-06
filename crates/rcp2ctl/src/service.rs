@@ -28,7 +28,8 @@ pub(crate) fn unit_text(exe: &Path) -> String {
          ExecStart=\"{}\" daemon\n\
          Restart=on-failure\n\
          RestartSec=2\n\
-         # Least privilege: it only reads a device file and serves a local socket.\n\
+         # Least privilege: it reads a device file, serves a local socket and talks\n\
+         # to PipeWire through its local sockets (pactl, pw-dump).\n\
          NoNewPrivileges=yes\n\
          LockPersonality=yes\n\
          MemoryDenyWriteExecute=yes\n\
@@ -38,6 +39,9 @@ pub(crate) fn unit_text(exe: &Path) -> String {
          SystemCallArchitectures=native\n\
          SystemCallFilter=@system-service\n\
          SystemCallFilter=~@privileged @resources\n\
+         # Refused calls fail instead of killing: PipeWire's tools try to get\n\
+         # realtime scheduling and carry on without it.\n\
+         SystemCallErrorNumber=EPERM\n\
          UMask=0077\n\
          \n\
          [Install]\n\
@@ -123,5 +127,6 @@ mod tests {
         assert!(text.contains("WantedBy=default.target"));
         assert!(text.contains("NoNewPrivileges=yes"));
         assert!(text.contains("RestrictAddressFamilies=AF_UNIX\n"));
+        assert!(text.contains("SystemCallErrorNumber=EPERM\n"));
     }
 }

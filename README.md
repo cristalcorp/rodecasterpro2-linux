@@ -138,8 +138,13 @@ One effect is known and harmless, but you need to know about it:
 > The **board service** installed by `rcp2ctl hid setup` reads them for as long
 > as it runs, so this does not happen in normal use. It does happen after a
 > one-off `hid capture` without the service, and after the service is stopped
-> (for example by `rcp2ctl uninstall`): replug the board then. **Do not run a
-> capture during a recording or a live show.**
+> (for example by `rcp2ctl uninstall`): replug the board, or start the service
+> again (`systemctl --user restart rodecasterpro2-linux`), which also gives the
+> faders back. **Do not run a capture during a recording or a live show.**
+>
+> **Turn the board off before the computer.** If the computer shuts down first,
+> the service stops with it, the board freezes, and it may then hang when you
+> turn it off: unplug it in that case.
 
 ## 6. First steps
 
@@ -177,8 +182,8 @@ Every action shows its result on the message line, including how to undo it.
 
 ## 8. Command reference
 
-Every command also accepts `--help`. All of them, except `config`, the `hid`
-commands and `uninstall`, first recreate the named outputs if they are missing
+Every command also accepts `--help`. All of them, except `status`, `config`,
+the `hid` commands and `uninstall`, first recreate the named outputs if they are missing
 (see [How the named outputs are kept](#9-how-the-named-outputs-are-kept)).
 
 ### `rcp2ctl`
@@ -189,6 +194,7 @@ Opens the terminal interface. Refuses to start without a terminal.
 
 Shows the board's PipeWire sinks, whether each named output is present, and how
 the outputs are kept (created at each launch, kept by the config file, or off).
+Read-only: a missing output is shown as `absent`, never created.
 
 ### `rcp2ctl apps`
 
@@ -285,6 +291,10 @@ Undoes everything the tool did. See [Uninstallation](#12-uninstallation).
   through a PipeWire config file. Before writing it, the tool records what was
   at that path, with its permissions. **`persist off` (or `r`) puts it back
   byte for byte**, even if the generated file was deleted by hand in between.
+- **When the board is unplugged or reset**, its sound card goes away and the
+  named outputs remove themselves with it (rather than sending their sound to
+  another device). The board service recreates them as soon as the board is
+  back, if they are on; without the service, run `rcp2ctl` once.
 - **Files the tool did not write are never overwritten**, and symbolic links
   (dotfiles managers, Nix) are never followed or replaced: the tool stops and
   tells you.
@@ -307,7 +317,9 @@ Distribution packages should ship `packaging/udev/70-rodecaster-pro-2.rules` in
 The service (`rcp2ctl daemon`, run by systemd as your user, never as root)
 opens the session with the board, keeps reading it so that the faders keep
 working, and keeps a copy of the board's state up to date from its
-notifications. When the board is unplugged it waits and reconnects on its own.
+notifications. When the board is unplugged it waits and reconnects on its own,
+and recreates the named outputs once the board's sound card is back (see
+[How the named outputs are kept](#9-how-the-named-outputs-are-kept)).
 
 Other commands ask it for the state through a socket in your private runtime
 directory (`$XDG_RUNTIME_DIR/rodecasterpro2-linux/board.sock`, mode 0600):
@@ -390,8 +402,18 @@ persistence: run `rcp2ctl` once, or turn persistence on.
 
 **The faders no longer change the volume** — A session was opened and nobody
 reads the board any more: a capture was run without the service, or the
-service was stopped (see [Risks](#5-risks)). Unplug and replug the board's USB
-cable; with the service running, it does not happen again.
+service was stopped (see [Risks](#5-risks)). Start the service again
+(`systemctl --user restart rodecasterpro2-linux`) or unplug and replug the
+board's USB cable; with the service running, it does not happen again. A USB
+reset (`usbreset`) does not help.
+
+**The board hangs when you turn it off** — The computer was shut down first,
+so nothing read the board any more. Unplug it; next time, turn the board off
+before the computer.
+
+**The named outputs disappeared after unplugging the board** — The board
+service recreates them when it is back. Without the service, run `rcp2ctl`
+once.
 
 **"the board service is not running"** — Run `rcp2ctl hid setup`. To see why
 it stopped: `journalctl --user -u rodecasterpro2-linux`.

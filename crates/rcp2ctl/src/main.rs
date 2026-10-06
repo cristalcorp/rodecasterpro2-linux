@@ -1,6 +1,7 @@
 //! `rcp2ctl`: Linux control tool for the RØDECaster Pro II.
 
 mod daemon;
+mod keeper;
 mod service;
 mod settings;
 mod tui;
@@ -220,10 +221,8 @@ fn run(command: Command, out: &mut impl Write) -> Result<(), CliError> {
                 &mut notice_to_stderr,
             )
         }
-        Command::Status => {
-            let settings = load_settings()?;
-            status(&prepare(&settings)?, &settings, out)
-        }
+        // Read-only: shows missing outputs instead of creating them.
+        Command::Status => status(&snapshot()?, &load_settings()?, out),
         Command::Apps => apps(&prepare(&load_settings()?)?, out),
         Command::Route { app, channel } => route(&prepare(&load_settings()?)?, &app, channel, out),
         Command::Default { channel } => set_default(&prepare(&load_settings()?)?, channel, out),
@@ -373,10 +372,12 @@ fn status(graph: &Graph, settings: &Settings, out: &mut impl Write) -> Result<()
         (_, false) => "off (`rcp2ctl outputs on`)",
     };
     writeln!(out, "Named outputs: {mode}")?;
+    let mut missing = false;
     for channel in Channel::ALL {
         let state = if graph.virtual_sink(channel).is_some() {
             "present"
         } else {
+            missing = true;
             "absent"
         };
         writeln!(
@@ -384,6 +385,12 @@ fn status(graph: &Graph, settings: &Settings, out: &mut impl Write) -> Result<()
             "  {:<6} {:<12} {state}",
             channel.id(),
             channel.sink_name()
+        )?;
+    }
+    if missing && settings.outputs {
+        writeln!(
+            out,
+            "Missing outputs come back with `rcp2ctl outputs on` (or any other command)."
         )?;
     }
     if persisted == PersistState::Foreign {
