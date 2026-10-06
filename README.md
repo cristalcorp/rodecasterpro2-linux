@@ -214,7 +214,8 @@ Opens the terminal interface. Refuses to start without a terminal.
 Shows the board's PipeWire sinks, whether each named output is present, and how
 the outputs are kept (created at each launch, kept by the config file, or off).
 Read-only: a missing output is shown as `absent`, never created. Also shows
-whether the board service is installed and up to date.
+whether the board service is installed and up to date. Works with the board
+unplugged too: it says so and shows the rest.
 
 ### `rcp2ctl apps`
 

@@ -399,10 +399,26 @@ fn create_missing_outputs(settings: &Settings) -> Result<Restored, CliError> {
 }
 
 fn status(graph: &Graph, settings: &Settings, out: &mut impl Write) -> Result<(), CliError> {
-    let rode = graph.rode()?;
-    writeln!(out, "RØDECaster Pro II found")?;
-    writeln!(out, "  native stereo sink: {}", rode.stereo_sink)?;
-    writeln!(out, "  native multi sink:  {}", rode.multi_sink)?;
+    // Without the board, the rest is still worth showing.
+    let board_present = match graph.rode() {
+        Ok(rode) => {
+            writeln!(out, "RØDECaster Pro II found")?;
+            writeln!(out, "  native stereo sink: {}", rode.stereo_sink)?;
+            writeln!(out, "  native multi sink:  {}", rode.multi_sink)?;
+            true
+        }
+        Err(DetectError::NotFound) => {
+            writeln!(
+                out,
+                "RØDECaster Pro II: not found (is it plugged in and powered on?)"
+            )?;
+            false
+        }
+        Err(err) => {
+            writeln!(out, "RØDECaster Pro II: {err}")?;
+            false
+        }
+    };
     let paths = PersistPaths::from_env()?;
     let persisted = persist_state(&paths)?;
     let mode = match (persisted, settings.outputs) {
@@ -428,13 +444,22 @@ fn status(graph: &Graph, settings: &Settings, out: &mut impl Write) -> Result<()
             channel.sink_name()
         )?;
     }
+    let unit = service::unit_path().and_then(|path| service::unit_state(&path));
     if missing && settings.outputs {
-        writeln!(
-            out,
-            "Missing outputs come back with `rcp2ctl outputs on` (or any other command)."
-        )?;
+        let hint = match (board_present, &unit) {
+            (true, _) => {
+                "Missing outputs come back with `rcp2ctl outputs on` (or any other command)."
+            }
+            (false, Ok(UnitState::Ours)) => {
+                "Missing outputs come back on their own once the board is back (board service)."
+            }
+            (false, _) => {
+                "Missing outputs come back with `rcp2ctl outputs on` once the board is back."
+            }
+        };
+        writeln!(out, "{hint}")?;
     }
-    let service = match service::unit_path().and_then(|path| service::unit_state(&path)) {
+    let service = match unit {
         Ok(UnitState::Ours) => "installed, recreates the outputs when the board comes back",
         Ok(UnitState::Outdated) => {
             "installed by an older version, run `rcp2ctl hid setup` to update it"
