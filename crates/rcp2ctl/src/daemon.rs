@@ -4,7 +4,8 @@
 //! interface (I-007), so this service keeps reading for as long as it runs.
 //! It also keeps an up-to-date copy of the board's state tree, which other
 //! commands read through a private Unix socket. Read-only: it never writes a
-//! setting to the board.
+//! setting to the board. Alongside, it recreates the named outputs when the
+//! board's sound card comes back (see [`crate::keeper`]).
 
 use std::fs;
 use std::io::{self, BufRead as _, BufReader, Read as _, Write};
@@ -144,9 +145,18 @@ fn lock(shared: &SharedState) -> std::sync::MutexGuard<'_, Shared> {
 /// instance is running.
 pub(crate) fn run(log: &mut impl Write) -> Result<(), DaemonError> {
     let listener = bind(&socket_path()?)?;
+    if let Ok(crate::service::UnitState::Outdated) =
+        crate::service::unit_path().and_then(|path| crate::service::unit_state(&path))
+    {
+        let _ = writeln!(
+            log,
+            "this unit was written by an older version: run `rcp2ctl hid setup` to update it"
+        );
+    }
     let shared = SharedState::default();
     let server_state = Arc::clone(&shared);
     thread::spawn(move || serve(&listener, &server_state));
+    thread::spawn(|| crate::keeper::run(&mut io::stderr()));
     let sys_class = Path::new(rcp2_hid::SYS_CLASS_HIDRAW);
     loop {
         match rcp2_hid::find_device(sys_class).and_then(|path| {
