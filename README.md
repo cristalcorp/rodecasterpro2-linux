@@ -87,6 +87,25 @@ any channel can be assigned to any fader.
 - For board control only: `sudo`, once, to grant your user access to the board
   (see [Board access](#101-board-access)).
 
+### Tested setup
+
+Everything in this README was tested on this stack only (October 2026). Other
+versions and distributions should work, but are not verified yet:
+
+| Component | Version |
+|---|---|
+| Distribution | Arch Linux |
+| Kernel (`snd-usb-audio`, `hidraw`) | 7.2.8 |
+| PipeWire, with `pipewire-pulse`, `pipewire-alsa`, `pipewire-jack` | 1.6.9 |
+| WirePlumber | 0.5.18 |
+| PulseAudio daemon | none (`pactl` talks to `pipewire-pulse`) |
+| systemd (user service) | 262 |
+| RØDECaster Pro II firmware | 1.7.6 (state reading also checked on 1.6.8) |
+
+When you report a problem, please give the same details: `uname -r`,
+`pipewire --version`, `wireplumber --version`, your distribution, and the
+board's firmware version (shown by `rcp2ctl board`).
+
 ## 4. Installation
 
 There is no package yet. Build from source:
