@@ -19,6 +19,7 @@ use rcp2_audio::{
     enable_persistence, move_stream, original_recorded, persist_state, pipewire_config,
     refuse_symlink, remove_file_if_present, remove_runtime_outputs, set_default_sink, snapshot,
 };
+use service::UnitState;
 use settings::{Settings, SettingsError};
 
 /// Linux control tool for the RØDECaster Pro II (unofficial).
@@ -250,6 +251,9 @@ fn outputs(
     if state == Switch::Off && persist_state(&PersistPaths::from_env()?)? == PersistState::On {
         return Err(CliError::PersistentOutputs);
     }
+    // Held until the outputs match the saved setting: the board service
+    // cannot recreate them in between.
+    let _lock = outputs_lock()?;
     // Saved first: the in-memory settings only change once the file has.
     let updated = Settings {
         outputs: state == Switch::On,
@@ -257,7 +261,7 @@ fn outputs(
     settings::save(settings_path, &updated)?;
     *settings = updated;
     if state == Switch::On {
-        for text in restore_outputs(settings)?.notices() {
+        for text in create_missing_outputs(settings)?.notices() {
             notice(&text);
         }
         writeln!(out, "Named outputs on (created at each launch).")?;
@@ -315,9 +319,46 @@ impl Restored {
     }
 }
 
+/// Serialises changes to the named outputs between processes (the board
+/// service and the commands): otherwise two of them could create the same
+/// output twice, or the service could bring them back right after `outputs
+/// off`. Released when dropped. Without a runtime directory, nothing is
+/// locked.
+fn outputs_lock() -> Result<Option<std::fs::File>, CliError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    else {
+        return Ok(None);
+    };
+    let dir = runtime.join(APP_DIR);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(file_err(&dir))?;
+    let path = dir.join("outputs.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(file_err(&path))?;
+    file.lock().map_err(file_err(&path))?;
+    Ok(Some(file))
+}
+
 /// Creates the missing named outputs if they are on, without printing
 /// anything (the TUI owns the terminal).
 fn restore_outputs(settings: &Settings) -> Result<Restored, CliError> {
+    let _lock = outputs_lock()?;
+    create_missing_outputs(settings)
+}
+
+/// [`restore_outputs`], for a caller already holding [`outputs_lock`].
+fn create_missing_outputs(settings: &Settings) -> Result<Restored, CliError> {
     let graph = snapshot()?;
     let unchanged = |graph| Restored {
         graph,
@@ -393,6 +434,15 @@ fn status(graph: &Graph, settings: &Settings, out: &mut impl Write) -> Result<()
             "Missing outputs come back with `rcp2ctl outputs on` (or any other command)."
         )?;
     }
+    let service = match service::unit_path().and_then(|path| service::unit_state(&path)) {
+        Ok(UnitState::Ours) => "installed, recreates the outputs when the board comes back",
+        Ok(UnitState::Outdated) => {
+            "installed by an older version, run `rcp2ctl hid setup` to update it"
+        }
+        Ok(UnitState::Absent) => "not installed (`rcp2ctl hid setup`)",
+        Ok(UnitState::Foreign) | Err(_) => "unknown",
+    };
+    writeln!(out, "Board service: {service}")?;
     if persisted == PersistState::Foreign {
         writeln!(
             out,

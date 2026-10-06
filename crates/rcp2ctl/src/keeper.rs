@@ -83,7 +83,11 @@ fn watch(mut child: Child, log: &mut impl Write) {
 
 /// Creates the missing named outputs if they are on and the board is there.
 fn restore(log: &mut impl Write) {
-    let result = crate::load_settings().and_then(|settings| crate::restore_outputs(&settings));
+    // Settings read under the lock: an `outputs off` in progress is seen.
+    let result = crate::outputs_lock().and_then(|_lock| {
+        let settings = crate::load_settings()?;
+        crate::create_missing_outputs(&settings)
+    });
     match result {
         Ok(restored) => {
             for notice in restored.notices() {

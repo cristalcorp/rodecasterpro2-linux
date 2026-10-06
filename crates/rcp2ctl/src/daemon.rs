@@ -145,6 +145,14 @@ fn lock(shared: &SharedState) -> std::sync::MutexGuard<'_, Shared> {
 /// instance is running.
 pub(crate) fn run(log: &mut impl Write) -> Result<(), DaemonError> {
     let listener = bind(&socket_path()?)?;
+    if let Ok(crate::service::UnitState::Outdated) =
+        crate::service::unit_path().and_then(|path| crate::service::unit_state(&path))
+    {
+        let _ = writeln!(
+            log,
+            "this unit was written by an older version: run `rcp2ctl hid setup` to update it"
+        );
+    }
     let shared = SharedState::default();
     let server_state = Arc::clone(&shared);
     thread::spawn(move || serve(&listener, &server_state));

@@ -213,7 +213,8 @@ Opens the terminal interface. Refuses to start without a terminal.
 
 Shows the board's PipeWire sinks, whether each named output is present, and how
 the outputs are kept (created at each launch, kept by the config file, or off).
-Read-only: a missing output is shown as `absent`, never created.
+Read-only: a missing output is shown as `absent`, never created. Also shows
+whether the board service is installed and up to date.
 
 ### `rcp2ctl apps`
 
@@ -346,7 +347,8 @@ only your user can talk to it. It is read-only: it never writes a setting to
 the board.
 
 It runs the binary that installed it: if you move or rebuild `rcp2ctl`
-elsewhere, run `rcp2ctl hid setup` again.
+elsewhere, or after upgrading, run `rcp2ctl hid setup` again. `rcp2ctl status`
+tells you when the installed service was written by an older version.
 
 ### 10.3 What is read
 
@@ -376,6 +378,7 @@ firmware 1.6.8: fader positions and mute states match the board.
 | `/etc/udev/rules.d/70-rodecaster-pro-2.rules` | `hid setup` | `uninstall` |
 | `~/.config/systemd/user/rodecasterpro2-linux.service` (board service) | `hid setup` | `uninstall` |
 | `$XDG_RUNTIME_DIR/rodecasterpro2-linux/board.sock` (in memory) | while the service runs | stopping the service, logout |
+| `$XDG_RUNTIME_DIR/rodecasterpro2-linux/outputs.lock` (in memory, empty) | any command creating or removing outputs | logout |
 | Your `.rcp2cap` capture files | `hid capture` | delete them yourself |
 
 ## 12. Uninstallation
