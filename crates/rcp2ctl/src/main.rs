@@ -1051,42 +1051,66 @@ fn install_service(out: &mut impl Write) -> Result<(), CliError> {
     Ok(())
 }
 
+/// How a channel's output state is shown, in the CLI and the TUI.
+pub(crate) const fn mute_label(muted: Option<bool>) -> &'static str {
+    match muted {
+        Some(true) => "muted",
+        Some(false) => "on",
+        None => "?",
+    }
+}
+
+/// Shown while the board service has no state to give.
+pub(crate) const BOARD_NOT_CONNECTED: &str =
+    "Board service running, but the board is not connected.";
+/// Shown while the board service reads the board's state.
+pub(crate) const BOARD_BEING_READ: &str = "Board connected; its state is being read.";
+
 /// Prints a board state: shared by `board` (from the service) and `hid decode`.
 fn print_board(
     out: &mut impl Write,
     firmware: Option<&str>,
     channels: &[(usize, String, Option<bool>)],
-    faders: &[i32],
+    faders: &[Option<i32>],
 ) -> Result<(), CliError> {
     writeln!(out, "Firmware: {}", firmware.unwrap_or("(not reported)"))?;
     writeln!(out, "Channels (tree index, source, output):")?;
     for (index, source, muted) in channels {
-        let output = match muted {
-            Some(true) => "muted",
-            Some(false) => "on",
-            None => "?",
-        };
-        writeln!(out, "  0x{index:03x}  {source:<10}  {output}")?;
+        writeln!(out, "  0x{index:03x}  {source:<10}  {}", mute_label(*muted))?;
     }
-    let faders: Vec<String> = faders.iter().map(ToString::to_string).collect();
+    let faders: Vec<String> = faders
+        .iter()
+        .map(|level| level.map_or_else(|| "?".to_owned(), |level| level.to_string()))
+        .collect();
     writeln!(out, "Faders (0-127): {}", faders.join(" "))?;
     Ok(())
 }
 
+/// Asks the board service, again a few times while it says it is busy;
+/// asking again while it does not answer at all would only wait longer, and
+/// one that hung up is said as is (a restart takes longer than these tries).
+fn query_board() -> Result<daemon::StateDto, daemon::DaemonError> {
+    const ATTEMPTS: u32 = 3;
+    let mut attempt = 1;
+    loop {
+        match daemon::query_state() {
+            Err(daemon::DaemonError::Busy) if attempt < ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            answer => return answer,
+        }
+    }
+}
+
 fn board(out: &mut impl Write) -> Result<(), CliError> {
-    let state = daemon::query_state()?;
+    let state = query_board()?;
     if !state.connected {
-        writeln!(
-            out,
-            "Board service running, but the board is not connected."
-        )?;
+        writeln!(out, "{BOARD_NOT_CONNECTED}")?;
         return Ok(());
     }
     if !state.state_known {
-        writeln!(
-            out,
-            "Board connected; its state is being read. Try again in a moment."
-        )?;
+        writeln!(out, "{BOARD_BEING_READ} Try again in a moment.")?;
         return Ok(());
     }
     let channels: Vec<_> = state
@@ -1095,11 +1119,15 @@ fn board(out: &mut impl Write) -> Result<(), CliError> {
         .map(|channel| (channel.index, channel.source.clone(), channel.muted))
         .collect();
     print_board(out, state.firmware.as_deref(), &channels, &state.faders)?;
-    writeln!(
-        out,
-        "Changes applied since the last dump: {}",
-        state.notifications
-    )?;
+    if state.refreshing {
+        writeln!(out, "(Previous state: the board is being read again.)")?;
+    } else {
+        writeln!(
+            out,
+            "Changes applied since the last dump: {}",
+            state.notifications
+        )?;
+    }
     Ok(())
 }
 

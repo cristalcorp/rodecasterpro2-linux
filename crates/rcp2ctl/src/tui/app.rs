@@ -3,6 +3,8 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use rcp2_audio::{Channel, Graph};
 
+use super::board::Console;
+
 /// Which panel receives the arrow keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Focus {
@@ -44,6 +46,8 @@ pub(crate) struct App {
     pub(crate) output_selected: usize,
     pub(crate) message: Option<(Level, String)>,
     pub(crate) show_help: bool,
+    /// The board service's answers and what the Console panel shows.
+    pub(crate) console: Console,
 }
 
 impl App {
@@ -55,6 +59,7 @@ impl App {
             output_selected: 0,
             message: None,
             show_help: false,
+            console: Console::new(),
         }
     }
 

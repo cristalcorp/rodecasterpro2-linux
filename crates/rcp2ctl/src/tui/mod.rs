@@ -1,10 +1,11 @@
 //! Interactive terminal interface: `rcp2ctl` without a subcommand.
 
 mod app;
+mod board;
 mod view;
 
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,23 +14,45 @@ use ratatui::crossterm::event::{self, Event};
 use rcp2_audio::{Graph, PersistPaths, PwError, persist_state, snapshot};
 
 use self::app::{Action, App, Level};
+use self::board::{BoardIssue, BoardView, Patience};
 use self::view::Mode;
 use crate::settings::{self, Settings};
 use crate::{CliError, Switch, outputs, persist, prepare, route, set_default};
 
 /// How often the graph is re-read when nothing happens.
-const REFRESH_EVERY: Duration = Duration::from_secs(1);
+pub(crate) const REFRESH_EVERY: Duration = Duration::from_secs(1);
 /// How long to wait for a key before handling background refreshes.
 const INPUT_POLL: Duration = Duration::from_millis(100);
 
 /// A graph snapshot and when it was started: older ones are ignored.
 type Snapshot = (Instant, Result<Graph, PwError>);
 
+/// Asks the board service for the board state.
+fn board_view() -> BoardView {
+    crate::daemon::query_state().map_err(|err| BoardIssue::from(&err))
+}
+
+/// Asks the board service for the board state every second, on its own
+/// thread: a slow service never delays the graph or the keyboard.
+fn spawn_board_watcher() -> Receiver<BoardView> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            if sender.send(board_view()).is_err() {
+                break;
+            }
+            thread::sleep(REFRESH_EVERY);
+        }
+    });
+    receiver
+}
+
 pub(crate) fn run() -> Result<(), CliError> {
     let settings_path = settings::settings_path()?;
     let mut settings = settings::load(&settings_path)?;
     // Before the alternate screen, so its notice is visible after quitting.
     let mut app = App::new(prepare(&settings)?);
+    let boards = spawn_board_watcher();
     let (requests, snapshots) = spawn_refresher();
 
     let mut terminal = ratatui::try_init()?;
@@ -40,6 +63,7 @@ pub(crate) fn run() -> Result<(), CliError> {
         &settings_path,
         &requests,
         &snapshots,
+        &boards,
     );
     ratatui::restore();
     result
@@ -79,6 +103,7 @@ fn event_loop(
     settings_path: &Path,
     requests: &Sender<()>,
     snapshots: &Receiver<Snapshot>,
+    boards: &Receiver<BoardView>,
 ) -> Result<(), CliError> {
     let (mut mode, error) = current_mode(settings);
     if let Some(error) = error {
@@ -88,9 +113,25 @@ fn event_loop(
     let mut fresh_after = Instant::now();
     // Whether the message line holds a refresh error, cleared by the next success.
     let mut refresh_error_shown = false;
+    let mut watcher_gone = false;
     loop {
         terminal.draw(|frame| view::render(frame, app, mode))?;
 
+        while !watcher_gone {
+            match boards.try_recv() {
+                Ok(board) => app.console.record(board),
+                Err(TryRecvError::Empty) => break,
+                // Its thread is gone: say so rather than show a frozen state.
+                Err(TryRecvError::Disconnected) => {
+                    let issue = BoardIssue {
+                        text: "The board service is no longer asked: restart rcp2ctl.".to_owned(),
+                        patience: Patience::None,
+                    };
+                    app.console.record(Err(issue));
+                    watcher_gone = true;
+                }
+            }
+        }
         while let Ok((started, refresh)) = snapshots.try_recv() {
             if started < fresh_after {
                 continue;

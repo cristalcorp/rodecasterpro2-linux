@@ -182,7 +182,15 @@ The screen has a header (board, how the outputs are kept, default output), an
 
 - ★ marks the system's default output.
 - ♪ *n* shows how many applications play on an output.
+- F*n* shows which fader of the board carries that output (needs the board
+  service, see below).
 - "absent" means the named output does not exist right now.
+
+When the board service runs (`rcp2ctl hid setup`), a **Console** panel at the
+bottom shows the board's channel strips: fader, source, whether the output is
+muted (updated live) and the fader level. Fader levels are as of the last full
+read of the board: the board sends no update when a fader moves. Without the
+service, the panel says how to start it; everything else works the same.
 
 | Key | Action |
 |---|---|
@@ -347,6 +355,11 @@ directory (`$XDG_RUNTIME_DIR/rodecasterpro2-linux/board.sock`, mode 0600):
 only your user can talk to it. It is read-only: it never writes a setting to
 the board.
 
+Only one service runs at a time: it holds a lock file next to the socket, and a
+second one refuses to start. If the service crashes, systemd starts it again
+after 2 seconds; meanwhile, and while it reads the board again, the TUI keeps
+showing the last state, marked "refreshing".
+
 It runs the binary that installed it: if you move or rebuild `rcp2ctl`
 elsewhere, or after upgrading, run `rcp2ctl hid setup` again. `rcp2ctl status`
 tells you when the installed service was written by an older version.
@@ -378,7 +391,8 @@ firmware 1.6.8: fader positions and mute states match the board.
 | Per-application output memory, default output (WirePlumber state) | `route`, `default` | your desktop's sound settings |
 | `/etc/udev/rules.d/70-rodecaster-pro-2.rules` | `hid setup` | `uninstall` |
 | `~/.config/systemd/user/rodecasterpro2-linux.service` (board service) | `hid setup` | `uninstall` |
-| `$XDG_RUNTIME_DIR/rodecasterpro2-linux/board.sock` (in memory) | while the service runs | stopping the service, logout |
+| `$XDG_RUNTIME_DIR/rodecasterpro2-linux/board.sock` (in memory) | while the service runs | replaced at the next start, logout |
+| `$XDG_RUNTIME_DIR/rodecasterpro2-linux/board.lock` (in memory, empty) | while the service runs | logout |
 | `$XDG_RUNTIME_DIR/rodecasterpro2-linux/outputs.lock` (in memory, empty) | any command creating or removing outputs | logout |
 | Your `.rcp2cap` capture files | `hid capture` | delete them yourself |
 
@@ -462,7 +476,7 @@ opens the TUI; in scripts, use the commands from the reference.
 | Terminal interface | Done (audio side) |
 | Reading the board's state | Done: exact decoder, board service, `rcp2ctl board` |
 | Fix for the fader freeze | Done while the board service runs |
-| Board state in the TUI | Next |
+| Board state in the TUI | Done: Console panel, fader of each output |
 | Live fader levels in the TUI | Planned (faders send no live notification; MIDI is being evaluated) |
 | Writing board settings (mutes, gain, processing) | Later, one setting type at a time, each tested on hardware first |
 

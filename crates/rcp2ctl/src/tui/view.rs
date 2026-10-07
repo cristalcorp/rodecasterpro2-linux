@@ -10,7 +10,8 @@ use ratatui::widgets::{
 use rcp2_audio::{Channel, PersistState};
 
 use super::app::{App, Focus, Level};
-use crate::{channel_of, output_label};
+use super::board::BoardShown;
+use crate::{channel_of, mute_label, output_label};
 
 /// Golden yellow accent.
 const ACCENT: Color = Color::Rgb(255, 191, 0);
@@ -24,9 +25,25 @@ pub(crate) struct Mode {
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
-    let [header, body, message, keys] = Layout::vertical([
+    let board = app.console.shown();
+    // Inside the console's borders.
+    let inner_width = usize::from(frame.area().width.saturating_sub(2).max(1));
+    let lines = console_lines(board, inner_width);
+    // The console never takes the room of the body, the message or the keys,
+    // and is left out when even its borders and one line do not fit.
+    let room = frame.area().height.saturating_sub(1 + MIN_BODY + 1 + 1);
+    let (least, wanted) = console_heights(board, lines.len());
+    let console_height = if room < least { 0 } else { wanted.min(room) };
+    // A message cut short says so on its last line.
+    let lines = cut_lines(
+        lines,
+        usize::from(console_height.saturating_sub(2)),
+        inner_width,
+    );
+    let [header, body, console, message, keys] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(8),
+        Constraint::Min(MIN_BODY),
+        Constraint::Length(console_height),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -35,8 +52,11 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
         Layout::horizontal([Constraint::Length(30), Constraint::Min(40)]).areas(body);
 
     frame.render_widget(header_line(app, mode), header);
-    render_outputs(frame, app, outputs);
+    render_outputs(frame, app, board, outputs);
     render_apps(frame, app, apps);
+    if console_height > 0 {
+        render_console(frame, board, lines, console);
+    }
     frame.render_widget(message_line(app), message);
     frame.render_widget(keys_line(app), keys);
     if app.show_help {
@@ -94,7 +114,7 @@ fn panel(title: &str, focused: bool) -> Block<'_> {
     Block::bordered().title(title).border_style(style)
 }
 
-fn render_outputs(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_outputs(frame: &mut Frame<'_>, app: &App, board: &BoardShown, area: Rect) {
     let streams = app.graph.app_streams();
     let default = default_channel(app);
     let items: Vec<ListItem<'_>> = Channel::ALL
@@ -123,6 +143,15 @@ fn render_outputs(frame: &mut Frame<'_>, app: &App, area: Rect) {
             if default == Some(channel) {
                 spans.push(Span::styled(" ★", Style::new().fg(ACCENT)));
             }
+            // Compact, so several faders fit the panel: " F2,5,9".
+            let faders = board.faders_of(channel);
+            if !faders.is_empty() {
+                let list: Vec<String> = faders.iter().map(ToString::to_string).collect();
+                spans.push(Span::styled(
+                    format!(" F{}", list.join(",")),
+                    Style::new().fg(Color::DarkGray),
+                ));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -132,6 +161,136 @@ fn render_outputs(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .highlight_style(selection_style(focused));
     let mut state = ListState::default().with_selected(Some(app.output_selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Smallest height of the Outputs/Applications body: every named output
+/// and the two borders (checked against `Channel::ALL` by a test).
+const MIN_BODY: u16 = 8;
+
+/// Fewest rows worth drawing and rows wanted: borders, and the header with
+/// one strip or all of them; or the lines of a message.
+fn console_heights(board: &BoardShown, message_lines: usize) -> (u16, u16) {
+    let rows = |count: usize| u16::try_from(count).unwrap_or(u16::MAX);
+    match board {
+        BoardShown::Strips { strips, .. } => (4, rows(strips.len()).saturating_add(3)),
+        BoardShown::Message(_) => (3, rows(message_lines.max(1)).saturating_add(2)),
+    }
+}
+
+/// A message cut into lines of at most `width` columns, at spaces (a word
+/// longer than a line keeps its own line); nothing for the strips. Done per
+/// frame as it depends on the width, and costs a few words.
+fn console_lines(board: &BoardShown, width: usize) -> Vec<String> {
+    let BoardShown::Message(text) = board else {
+        return Vec::new();
+    };
+    let mut lines: Vec<String> = Vec::new();
+    // Width of the last line, kept rather than measured again per word.
+    let mut used = 0;
+    // Any whitespace (line breaks and tabs included) separates words.
+    for word in text.split_whitespace() {
+        let word_width = Span::raw(word).width();
+        if lines.last().is_some() && used + 1 + word_width <= width {
+            if let Some(line) = lines.last_mut() {
+                line.push(' ');
+                line.push_str(word);
+            }
+            used += 1 + word_width;
+            continue;
+        }
+        // A new line; a word wider than a line is broken across lines.
+        lines.push(String::new());
+        used = 0;
+        for ch in word.chars() {
+            let ch_width = Span::raw(&*ch.encode_utf8(&mut [0; 4])).width();
+            if used > 0 && used + ch_width > width {
+                lines.push(String::new());
+                used = 0;
+            }
+            if let Some(line) = lines.last_mut() {
+                line.push(ch);
+            }
+            used += ch_width;
+        }
+    }
+    lines
+}
+
+/// Keeps the first `rows` lines, the last of them ending with "…" when
+/// some had to go (characters give way until it fits; one of no width, such
+/// as a combining mark, frees no room on its own).
+fn cut_lines(mut lines: Vec<String>, rows: usize, width: usize) -> Vec<String> {
+    if lines.len() > rows {
+        lines.truncate(rows);
+        if let Some(last) = lines.last_mut() {
+            while Span::raw(last.as_str()).width() + 1 > width && last.pop().is_some() {}
+            last.push('…');
+        }
+    }
+    lines
+}
+
+fn render_console(frame: &mut Frame<'_>, board: &BoardShown, lines: Vec<String>, area: Rect) {
+    let (strips, refreshing) = match board {
+        BoardShown::Strips { strips, refreshing } => (strips, *refreshing),
+        BoardShown::Message(_) => {
+            let text: Vec<Line<'_>> = lines.into_iter().map(Line::from).collect();
+            frame.render_widget(
+                Paragraph::new(text)
+                    .style(Style::new().fg(Color::DarkGray))
+                    .block(panel(" Console ", false)),
+                area,
+            );
+            return;
+        }
+    };
+    let title = if refreshing {
+        " Console (refreshing…) "
+    } else {
+        " Console "
+    };
+    let rows = strips.iter().map(|strip| {
+        let style = match strip.muted {
+            Some(true) => Style::new().fg(Color::Red),
+            Some(false) => Style::new().fg(Color::Green),
+            None => Style::new(),
+        };
+        let level = match (strip.fader, strip.level) {
+            (Some(_), Some(level)) => fader_bar(level),
+            (Some(_), None) => "?".to_owned(),
+            (None, _) => String::new(),
+        };
+        Row::new(vec![
+            Cell::from(
+                strip
+                    .fader
+                    .map_or_else(|| "-".to_owned(), |fader| format!("F{fader}")),
+            ),
+            Cell::from(strip.source.as_str()),
+            Cell::from(mute_label(strip.muted)).style(style),
+            Cell::from(level),
+        ])
+    });
+    let header = Row::new(["FADER", "SOURCE", "OUTPUT", "LEVEL (last full read)"])
+        .style(Style::new().add_modifier(Modifier::BOLD));
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(6),
+            Constraint::Length(12),
+            Constraint::Length(7),
+            Constraint::Min(20),
+        ],
+    )
+    .header(header)
+    .block(panel(title, false));
+    frame.render_widget(table, area);
+}
+
+/// A 0–127 fader level as a 12-cell bar and its value.
+fn fader_bar(level: i32) -> String {
+    let filled = usize::try_from(level.clamp(0, 127) * 12 / 127).unwrap_or(0);
+    format!("{}{} {level}", "█".repeat(filled), "·".repeat(12 - filled))
 }
 
 fn render_apps(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -232,7 +391,7 @@ fn render_help(frame: &mut Frame<'_>) {
         .collect();
     lines.push(Line::raw(""));
     lines.push(Line::raw(
-        "★ default output   ♪ applications playing   any key closes",
+        "★ default  ♪ apps playing  Fn fader on the board  any key closes",
     ));
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(panel(" Help ", true)), area);
@@ -250,17 +409,23 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, keys_text, render};
-    use crate::tui::app::App;
-    use crate::tui::app::Focus;
+    use super::{BoardShown, MIN_BODY, Mode, keys_text, render};
+    use crate::daemon::DaemonError;
+    use crate::tui::app::{App, Focus};
+    use crate::tui::board::BoardIssue;
+    use crate::tui::board::tests::board_state;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use rcp2_audio::{Graph, PersistState};
+    use rcp2_audio::{Channel, Graph, PersistState};
 
     const DUMP: &str = include_str!("../../../rcp2-audio/tests/fixtures/pw-dump.json");
 
     fn screen(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        screen_of_height(app, 24)
+    }
+
+    fn screen_of_height(app: &App, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, height)).unwrap();
         let mode = Mode {
             outputs_on: true,
             persist: Some(PersistState::Off),
@@ -297,6 +462,28 @@ mod tests {
     }
 
     #[test]
+    fn a_short_terminal_keeps_the_message_and_keys_lines() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.console.record(Ok(board_state(true)));
+        app.message = Some((crate::tui::app::Level::Info, "hello there".to_owned()));
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        let mode = Mode {
+            outputs_on: true,
+            persist: Some(PersistState::Off),
+        };
+        terminal.draw(|frame| render(frame, &app, mode)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("hello there"));
+        assert!(text.contains("q quit"));
+    }
+
+    #[test]
     fn help_overlays_the_screen() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
         app.show_help = true;
@@ -311,5 +498,133 @@ mod tests {
             let width = ratatui::text::Line::from(keys_text(&app)).width();
             assert!(width <= 80, "{width} columns");
         }
+    }
+
+    #[test]
+    fn the_body_always_fits_every_output() {
+        let rows = u16::try_from(Channel::ALL.len()).unwrap() + 2;
+        assert_eq!(MIN_BODY, rows);
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.console.record(Ok(board_state(true)));
+        // The console wants 10 rows here; the body keeps its 8.
+        let screen = screen_of_height(&app, 20);
+        assert!(screen.contains("6 RØDE B"), "{screen}");
+        assert!(screen.contains("Console"), "{screen}");
+    }
+
+    #[test]
+    fn a_tiny_terminal_leaves_the_console_out() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.console.record(Ok(board_state(true)));
+        app.message = Some((crate::tui::app::Level::Info, "hello there".to_owned()));
+        let screen = screen_of_height(&app, 12);
+        assert!(screen.contains("hello there"), "{screen}");
+        assert!(screen.contains("q quit"), "{screen}");
+        assert!(screen.contains("6 RØDE B"), "{screen}");
+        assert!(!screen.contains("Console"), "{screen}");
+    }
+
+    #[test]
+    fn a_console_without_room_for_one_strip_is_left_out() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.console.record(Ok(board_state(true)));
+        // 3 rows free: borders and header, no strip.
+        assert!(!screen_of_height(&app, 14).contains("Console"));
+        assert!(screen_of_height(&app, 15).contains("Mic 1"));
+    }
+
+    #[test]
+    fn shows_the_board_and_the_fader_of_each_output() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.console.record(Ok(board_state(true)));
+        let screen = screen(&app);
+        assert!(screen.contains("3 RØDE Game   ♪1 ★ F5"), "{screen}");
+        assert!(screen.contains("F1"), "{screen}");
+        assert!(screen.contains("Mic 1"), "{screen}");
+        assert!(screen.contains("muted"), "{screen}");
+        assert!(screen.contains("████████████ 127"), "{screen}");
+        // Empty strips are hidden; an unreadable source is shown, with an
+        // unreadable level; a strip past the last fader has none.
+        assert!(!screen.contains("(empty)"), "{screen}");
+        assert!(screen.contains("F7     ?"), "{screen}");
+        assert!(screen.contains("source 9"), "{screen}");
+    }
+
+    #[test]
+    fn marks_a_state_that_may_be_out_of_date() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        let mut state = board_state(true);
+        state.refreshing = true;
+        app.console.record(Ok(state));
+        let screen = screen(&app);
+        assert!(screen.contains("Console (refreshing…)"), "{screen}");
+        assert!(screen.contains("F5"), "{screen}");
+    }
+
+    #[test]
+    fn a_long_message_wraps_instead_of_being_cut() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        let issue = BoardIssue::from(&DaemonError::ServiceOlder);
+        app.console.record(Err(issue.clone()));
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let mode = Mode {
+            outputs_on: true,
+            persist: Some(PersistState::Off),
+        };
+        terminal.draw(|frame| render(frame, &app, mode)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        let squeezed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let shown = squeezed(&text.replace('│', " "));
+        assert!(shown.contains(&squeezed(&issue.text)), "{shown}");
+    }
+
+    #[test]
+    fn an_unplugged_board_leaves_no_fader_on_the_outputs() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.console.record(Ok(board_state(true)));
+        assert!(screen(&app).contains("★ F5"));
+        let mut unplugged = board_state(false);
+        unplugged.connected = false;
+        app.console.record(Ok(unplugged));
+        let screen = screen(&app);
+        assert!(screen.contains(crate::BOARD_NOT_CONNECTED), "{screen}");
+        assert!(!screen.contains("F5"), "{screen}");
+        assert!(!screen.contains('{'), "{screen}");
+    }
+
+    #[test]
+    fn a_message_cut_short_says_so() {
+        let lines = vec!["one".to_owned(), "two".to_owned(), "three".to_owned()];
+        assert_eq!(super::cut_lines(lines.clone(), 3, 10), lines);
+        assert_eq!(super::cut_lines(lines.clone(), 2, 10), vec!["one", "two…"]);
+        assert_eq!(super::cut_lines(lines, 2, 3), vec!["one", "tw…"]);
+        // A combining mark ending a full line gives way with its letter.
+        let marked = vec!["one".to_owned(), "abe\u{301}".to_owned(), "x".to_owned()];
+        assert_eq!(super::cut_lines(marked, 2, 3), vec!["one", "ab…"]);
+    }
+
+    #[test]
+    fn wrapping_handles_breaks_and_long_words() {
+        let board = BoardShown::Message("ab\ncd\tefghijkl m".to_owned());
+        assert_eq!(
+            super::console_lines(&board, 5),
+            vec!["ab cd", "efghi", "jkl m"]
+        );
+    }
+
+    #[test]
+    fn a_message_without_room_to_wrap_keeps_the_body() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        let issue = BoardIssue::from(&DaemonError::ServiceOlder);
+        app.console.record(Err(issue));
+        let screen = screen_of_height(&app, 14);
+        assert!(screen.contains("6 RØDE B"), "{screen}");
+        assert!(screen.contains("q quit"), "{screen}");
     }
 }
