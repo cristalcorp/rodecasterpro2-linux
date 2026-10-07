@@ -1061,7 +1061,8 @@ pub(crate) const fn mute_label(muted: Option<bool>) -> &'static str {
 }
 
 /// Shown while the board service has no state to give.
-pub(crate) const BOARD_NOT_CONNECTED: &str = "{BOARD_NOT_CONNECTED}";
+pub(crate) const BOARD_NOT_CONNECTED: &str =
+    "Board service running, but the board is not connected.";
 /// Shown while the board service reads the board's state.
 pub(crate) const BOARD_BEING_READ: &str = "Board connected; its state is being read.";
 
@@ -1088,10 +1089,7 @@ fn print_board(
 fn board(out: &mut impl Write) -> Result<(), CliError> {
     let state = daemon::query_state()?;
     if !state.connected {
-        writeln!(
-            out,
-            "Board service running, but the board is not connected."
-        )?;
+        writeln!(out, "{BOARD_NOT_CONNECTED}")?;
         return Ok(());
     }
     if !state.state_known {

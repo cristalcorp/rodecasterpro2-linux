@@ -27,9 +27,14 @@ pub(crate) struct Mode {
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
     let board = BoardPanel::new(app);
-    // The console never takes the room of the body, the message or the keys.
+    // The console never takes the room of the body, the message or the keys,
+    // and is left out when even its borders and one line do not fit.
     let room = frame.area().height.saturating_sub(1 + MIN_BODY + 1 + 1);
-    let console_height = board.height().min(room.max(3));
+    let console_height = if room < 3 {
+        0
+    } else {
+        board.height().min(room)
+    };
     let [header, body, console, message, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(MIN_BODY),
@@ -44,7 +49,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
     frame.render_widget(header_line(app, mode), header);
     render_outputs(frame, app, &board, outputs);
     render_apps(frame, app, apps);
-    render_console(frame, &board, console);
+    if console_height > 0 {
+        render_console(frame, &board, console);
+    }
     frame.render_widget(message_line(app), message);
     frame.render_widget(keys_line(app), keys);
     if app.show_help {
@@ -148,8 +155,9 @@ fn render_outputs(frame: &mut Frame<'_>, app: &App, board: &BoardPanel<'_>, area
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// Smallest height of the Outputs/Applications body.
-const MIN_BODY: u16 = 6;
+/// Smallest height of the Outputs/Applications body: every named output
+/// and the two borders (checked against `Channel::ALL` by a test).
+const MIN_BODY: u16 = 8;
 
 /// The board's source feeding a named output, when known.
 const fn channel_source(channel: Channel) -> Option<InputSource> {
@@ -192,9 +200,14 @@ impl<'a> BoardPanel<'a> {
             Some(Err(BoardIssue::NotRunning)) => Self::Message(
                 "Board service not running: `rcp2ctl hid setup` installs it.".to_owned(),
             ),
-            Some(Err(BoardIssue::Other(reason))) => {
+            Some(Err(BoardIssue::Version(reason))) => {
                 Self::Message(format!("Board service: {reason}"))
             }
+            // A failed poll or two: `set_board` keeps the last state meanwhile.
+            Some(Err(BoardIssue::Other(reason))) => app.last_known.as_ref().map_or_else(
+                || Self::Message(format!("Board service: {reason}")),
+                |last| shown(last, true),
+            ),
             Some(Ok(state)) if state.connected && state.state_known => shown(state, false),
             Some(Ok(state)) if state.connected => app.last_known.as_ref().map_or_else(
                 || Self::Message(BOARD_BEING_READ.to_owned()),
@@ -421,17 +434,21 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, keys_text, render};
+    use super::{MIN_BODY, Mode, keys_text, render};
     use crate::tui::app::Focus;
     use crate::tui::app::{App, BoardIssue};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use rcp2_audio::{Graph, PersistState};
+    use rcp2_audio::{Channel, Graph, PersistState};
 
     const DUMP: &str = include_str!("../../../rcp2-audio/tests/fixtures/pw-dump.json");
 
     fn screen(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        screen_of_height(app, 24)
+    }
+
+    fn screen_of_height(app: &App, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, height)).unwrap();
         let mode = Mode {
             outputs_on: true,
             persist: Some(PersistState::Off),
@@ -478,6 +495,7 @@ mod tests {
         StateDto {
             version: crate::daemon::PROTOCOL_VERSION,
             connected: true,
+            session: 1,
             state_known: known,
             firmware: Some("1.7.6".to_owned()),
             channels: if known {
@@ -589,5 +607,89 @@ mod tests {
             let width = ratatui::text::Line::from(keys_text(&app)).width();
             assert!(width <= 80, "{width} columns");
         }
+    }
+
+    #[test]
+    fn says_when_the_board_is_unplugged() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.set_board(Ok(board_state(true)));
+        let mut unplugged = board_state(false);
+        unplugged.connected = false;
+        app.set_board(Ok(unplugged));
+        let screen = screen(&app);
+        assert!(screen.contains(crate::BOARD_NOT_CONNECTED), "{screen}");
+        assert!(!screen.contains('{'), "{screen}");
+        assert!(!screen.contains("F5"), "{screen}");
+    }
+
+    #[test]
+    fn a_new_session_drops_the_last_state() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.set_board(Ok(board_state(true)));
+        // Unplugged and plugged back between two polls.
+        let mut replugged = board_state(false);
+        replugged.session = 2;
+        app.set_board(Ok(replugged));
+        let screen = screen(&app);
+        assert!(screen.contains(crate::BOARD_BEING_READ), "{screen}");
+        assert!(!screen.contains("F5"), "{screen}");
+    }
+
+    #[test]
+    fn a_few_failed_polls_keep_the_last_state() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.set_board(Ok(board_state(true)));
+        let busy = || Err(BoardIssue::Other("socket timed out".to_owned()));
+        for _ in 0..3 {
+            app.set_board(busy());
+            let screen = screen(&app);
+            assert!(screen.contains("Console (refreshing…)"), "{screen}");
+            assert!(screen.contains("F5"), "{screen}");
+        }
+        app.set_board(busy());
+        let screen = screen(&app);
+        assert!(
+            screen.contains("Board service: socket timed out"),
+            "{screen}"
+        );
+        // An answer resets the count.
+        app.set_board(Ok(board_state(true)));
+        app.set_board(busy());
+        assert!(screen_of_height(&app, 24).contains("F5"));
+    }
+
+    #[test]
+    fn another_protocol_version_is_said_at_once() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.set_board(Ok(board_state(true)));
+        let reason = crate::daemon::DaemonError::ServiceOlder.to_string();
+        app.set_board(Err(BoardIssue::Version(reason.clone())));
+        let screen = screen(&app);
+        assert!(screen.contains("older than this rcp2ctl"), "{screen}");
+        assert!(!screen.contains("F5"), "{screen}");
+    }
+
+    #[test]
+    fn the_body_always_fits_every_output() {
+        let rows = u16::try_from(Channel::ALL.len()).unwrap() + 2;
+        assert_eq!(MIN_BODY, rows);
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.set_board(Ok(board_state(true)));
+        // The console wants 10 rows here; the body keeps its 8.
+        let screen = screen_of_height(&app, 20);
+        assert!(screen.contains("6 RØDE B"), "{screen}");
+        assert!(screen.contains("Console"), "{screen}");
+    }
+
+    #[test]
+    fn a_tiny_terminal_leaves_the_console_out() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.set_board(Ok(board_state(true)));
+        app.message = Some((crate::tui::app::Level::Info, "hello there".to_owned()));
+        let screen = screen_of_height(&app, 12);
+        assert!(screen.contains("hello there"), "{screen}");
+        assert!(screen.contains("q quit"), "{screen}");
+        assert!(screen.contains("6 RØDE B"), "{screen}");
+        assert!(!screen.contains("Console"), "{screen}");
     }
 }

@@ -51,13 +51,21 @@ pub(crate) struct App {
     /// The last complete state, shown (as refreshing) while the service
     /// reads the board again, so the screen does not jump.
     pub(crate) last_known: Option<StateDto>,
+    /// Failed polls in a row since the last answer from the service.
+    failed_polls: u8,
 }
+
+/// Failed polls in a row (one a second) still shown as the last state:
+/// a busy service is not worth a flicker, a lasting failure is worth saying.
+const TOLERATED_FAILURES: u8 = 3;
 
 /// Why the board state is unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BoardIssue {
     /// No board service answers.
     NotRunning,
+    /// The service speaks another protocol version, with what to do.
+    Version(String),
     /// Anything else, with the reason to show.
     Other(String),
 }
@@ -76,17 +84,31 @@ impl App {
             show_help: false,
             board: None,
             last_known: None,
+            failed_polls: 0,
         }
     }
 
     /// Records the board service's answer, keeping the last complete state
-    /// for as long as the board stays connected.
+    /// for as long as the same board session lasts, and through a few
+    /// failed polls.
     pub(crate) fn set_board(&mut self, view: BoardView) {
+        if matches!(view, Err(BoardIssue::Other(_))) {
+            self.failed_polls = self.failed_polls.saturating_add(1);
+        } else {
+            self.failed_polls = 0;
+        }
         match &view {
             Ok(state) if state.connected && state.state_known => {
                 self.last_known = Some(state.clone());
             }
-            Ok(state) if state.connected => {}
+            // Same session, being read again: the last state still holds.
+            Ok(state)
+                if state.connected
+                    && self
+                        .last_known
+                        .as_ref()
+                        .is_some_and(|last| last.session == state.session) => {}
+            Err(BoardIssue::Other(_)) if self.failed_polls <= TOLERATED_FAILURES => {}
             _ => self.last_known = None,
         }
         self.board = Some(view);

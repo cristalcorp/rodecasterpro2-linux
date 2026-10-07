@@ -31,7 +31,8 @@ const MAX_REQUEST: u64 = 256;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Version of the socket protocol.
 /// 2: channels carry their source code, fader levels may be unreadable.
-pub(crate) const PROTOCOL_VERSION: u32 = 2;
+/// 3: each board session has its own number.
+pub(crate) const PROTOCOL_VERSION: u32 = 3;
 /// Least time between two requests for a new dump.
 const RESYNC_EVERY: Duration = Duration::from_secs(5);
 /// Notifications kept while waiting for a dump; beyond that, a new dump is
@@ -55,6 +56,12 @@ pub(crate) enum DaemonError {
     NotRunning,
     #[error("the board service sent an invalid answer: {0}")]
     BadAnswer(String),
+    #[error(
+        "the board service is older than this rcp2ctl: run `hid setup` with this rcp2ctl to update it"
+    )]
+    ServiceOlder,
+    #[error("the board service is newer than this rcp2ctl: use the rcp2ctl it was installed with")]
+    ServiceNewer,
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> DaemonError + use<> {
@@ -92,6 +99,10 @@ pub(crate) struct StateDto {
     pub(crate) version: u32,
     /// A session with the board is open.
     pub(crate) connected: bool,
+    /// Number of the board session, new after every unplug: a state from
+    /// another session no longer describes the board.
+    #[serde(default)]
+    pub(crate) session: u64,
     /// The board's state is known (false while the first or a new dump is read).
     pub(crate) state_known: bool,
     pub(crate) firmware: Option<String>,
@@ -103,11 +114,18 @@ pub(crate) struct StateDto {
 }
 
 impl StateDto {
-    fn new(connected: bool, tree: Option<&Node>, notifications: u64) -> Self {
-        let state = tree.map(BoardState::from_tree).unwrap_or_default();
+    fn new(shared: &Shared) -> Self {
+        let Shared {
+            connected,
+            session,
+            ref tree,
+            notifications,
+        } = *shared;
+        let state = tree.as_ref().map(BoardState::from_tree).unwrap_or_default();
         Self {
             version: PROTOCOL_VERSION,
             connected,
+            session,
             state_known: tree.is_some(),
             firmware: state.firmware,
             channels: state
@@ -130,6 +148,8 @@ impl StateDto {
 #[derive(Default)]
 struct Shared {
     connected: bool,
+    /// Incremented each time a session opens; kept across sessions.
+    session: u64,
     tree: Option<Node>,
     notifications: u64,
 }
@@ -173,7 +193,11 @@ pub(crate) fn run(log: &mut impl Write) -> Result<(), DaemonError> {
                 let _ = writeln!(log, "board found at {}: opening a session", path.display());
                 let reason = session(board, &shared, log);
                 let _ = writeln!(log, "session ended: {reason}");
-                *lock(&shared) = Shared::default();
+                let mut state = lock(&shared);
+                *state = Shared {
+                    session: state.session,
+                    ..Shared::default()
+                };
             }
             Err(rcp2_hid::HidError::NotFound) => {}
             Err(err) => {
@@ -213,7 +237,11 @@ fn session(mut board: rcp2_hid::Board, shared: &SharedState, log: &mut impl Writ
     if let Err(err) = sync.request(&mut board) {
         return err.to_string();
     }
-    lock(shared).connected = true;
+    {
+        let mut state = lock(shared);
+        state.connected = true;
+        state.session = state.session.wrapping_add(1);
+    }
     loop {
         let report = match reports.recv_timeout(RESYNC_EVERY) {
             Ok(Ok(report)) => Some(report),
@@ -363,10 +391,7 @@ fn answer(stream: UnixStream, shared: &SharedState) -> io::Result<()> {
     if request.trim() != "state" {
         return writeln!(stream, "{{\"error\":\"unknown request\"}}");
     }
-    let answer = {
-        let state = lock(shared);
-        StateDto::new(state.connected, state.tree.as_ref(), state.notifications)
-    };
+    let answer = StateDto::new(&lock(shared));
     let json = serde_json::to_string(&answer).map_err(io::Error::other)?;
     writeln!(stream, "{json}")
 }
@@ -375,9 +400,26 @@ fn answer(stream: UnixStream, shared: &SharedState) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns [`DaemonError::NotRunning`] if no service answers, and
-/// [`DaemonError::BadAnswer`] if the answer cannot be read.
+/// Returns [`DaemonError::NotRunning`] if no service answers,
+/// [`DaemonError::BadAnswer`] if the answer cannot be read, and
+/// [`DaemonError::ServiceOlder`] or [`DaemonError::ServiceNewer`] if the
+/// service speaks another protocol version.
 pub(crate) fn query_state() -> Result<StateDto, DaemonError> {
+    let state = query_any_version()?;
+    check_version(state.version)?;
+    Ok(state)
+}
+
+/// Accepts only the protocol version this build speaks.
+fn check_version(version: u32) -> Result<(), DaemonError> {
+    match version.cmp(&PROTOCOL_VERSION) {
+        std::cmp::Ordering::Less => Err(DaemonError::ServiceOlder),
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err(DaemonError::ServiceNewer),
+    }
+}
+
+fn query_any_version() -> Result<StateDto, DaemonError> {
     let path = socket_path()?;
     let mut stream = UnixStream::connect(&path).map_err(|_| DaemonError::NotRunning)?;
     stream
@@ -393,7 +435,7 @@ pub(crate) fn query_state() -> Result<StateDto, DaemonError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{StateDto, apply};
+    use super::{DaemonError, PROTOCOL_VERSION, Shared, StateDto, apply, check_version};
     use rcp2_proto::{Change, Node, Var};
 
     #[test]
@@ -419,11 +461,29 @@ mod tests {
 
     #[test]
     fn a_session_without_a_tree_is_connected_but_unknown() {
-        let state = StateDto::new(true, None, 0);
+        let state = StateDto::new(&Shared {
+            connected: true,
+            session: 4,
+            ..Shared::default()
+        });
         assert!(state.connected);
+        assert_eq!(state.session, 4);
         assert!(!state.state_known);
         assert!(state.channels.is_empty());
         let json = serde_json::to_string(&state).unwrap();
         assert_eq!(serde_json::from_str::<StateDto>(&json).unwrap(), state);
+    }
+
+    #[test]
+    fn another_protocol_version_says_which_side_is_behind() {
+        assert!(check_version(PROTOCOL_VERSION).is_ok());
+        assert!(matches!(
+            check_version(PROTOCOL_VERSION - 1),
+            Err(DaemonError::ServiceOlder)
+        ));
+        assert!(matches!(
+            check_version(PROTOCOL_VERSION + 1),
+            Err(DaemonError::ServiceNewer)
+        ));
     }
 }

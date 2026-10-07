@@ -27,14 +27,14 @@ type Snapshot = (Instant, Result<Graph, PwError>);
 
 /// Asks the board service for the board state.
 fn board_view() -> BoardView {
-    match crate::daemon::query_state() {
-        Ok(state) if state.version == crate::daemon::PROTOCOL_VERSION => Ok(state),
-        Ok(_) => Err(BoardIssue::Other(
-            "the running service is another version: run `rcp2ctl hid setup` again".to_owned(),
-        )),
-        Err(crate::daemon::DaemonError::NotRunning) => Err(BoardIssue::NotRunning),
-        Err(err) => Err(BoardIssue::Other(err.to_string())),
-    }
+    use crate::daemon::DaemonError;
+    crate::daemon::query_state().map_err(|err| match err {
+        DaemonError::NotRunning => BoardIssue::NotRunning,
+        DaemonError::ServiceOlder | DaemonError::ServiceNewer => {
+            BoardIssue::Version(err.to_string())
+        }
+        err => BoardIssue::Other(err.to_string()),
+    })
 }
 
 /// Asks the board service for the board state every second, on its own
