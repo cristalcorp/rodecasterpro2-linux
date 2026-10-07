@@ -42,18 +42,11 @@ impl InputSource {
 
     /// Interprets a `channelInputSource` value.
     #[must_use]
-    pub const fn from_code(code: i32) -> Self {
-        let mut position = 0;
-        while position < Self::NAMED.len() {
-            let named = Self::NAMED[position];
-            if let Some(named_code) = named.code()
-                && named_code == code
-            {
-                return named;
-            }
-            position += 1;
-        }
-        Self::Code(code)
+    pub fn from_code(code: i32) -> Self {
+        Self::NAMED
+            .into_iter()
+            .find(|named| named.code() == Some(code))
+            .unwrap_or(Self::Code(code))
     }
 
     /// The `channelInputSource` code, `None` for [`InputSource::Unknown`].
