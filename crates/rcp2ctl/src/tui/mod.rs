@@ -31,14 +31,13 @@ fn board_view() -> BoardView {
     // Worded to follow "Board service: ".
     crate::daemon::query_state().map_err(|err| match err {
         DaemonError::NotRunning => BoardIssue::NotRunning,
-        DaemonError::ServiceOlder => BoardIssue::Version(
-            "older than this rcp2ctl: restart it with this one \
-             (`rcp2ctl hid setup` does it for the systemd service)"
-                .to_owned(),
-        ),
-        DaemonError::ServiceNewer => BoardIssue::Version(
-            "newer than this rcp2ctl: use the rcp2ctl it was installed with".to_owned(),
-        ),
+        // Kept short: the console gives a message one line.
+        DaemonError::ServiceOlder => {
+            BoardIssue::Version("older than this rcp2ctl, restart it with this one".to_owned())
+        }
+        DaemonError::ServiceNewer => {
+            BoardIssue::Version("newer than this rcp2ctl, use the newer rcp2ctl".to_owned())
+        }
         DaemonError::BadAnswer(reason) => BoardIssue::Other(format!("invalid answer: {reason}")),
         err => BoardIssue::Other(err.to_string()),
     })

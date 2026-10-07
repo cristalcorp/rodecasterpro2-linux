@@ -193,14 +193,14 @@ enum BoardPanel<'a> {
 impl<'a> BoardPanel<'a> {
     fn new(app: &'a App) -> Self {
         match &app.board {
-            BoardShown::State { state, refreshing } => {
+            BoardShown::State(state) => {
                 let strips = strips(state);
                 if strips.is_empty() {
                     Self::Message("No channel is assigned on the board.".to_owned())
                 } else {
                     Self::State {
                         strips,
-                        refreshing: *refreshing,
+                        refreshing: state.refreshing,
                     }
                 }
             }
@@ -645,18 +645,18 @@ mod tests {
         app.set_board(Ok(board_state(true)), start);
         let busy = || Err(BoardIssue::Other("socket timed out".to_owned()));
         // Polls slowed down by the service: time counts, not polls.
-        app.set_board(busy(), start + Duration::from_secs(2));
+        app.set_board(busy(), start + Duration::from_secs(4));
         let screen_now = screen(&app);
         assert!(screen_now.contains("Console (refreshing…)"), "{screen_now}");
         assert!(screen_now.contains("F5"), "{screen_now}");
-        app.set_board(busy(), start + Duration::from_secs(3));
+        app.set_board(busy(), start + Duration::from_secs(5));
         let screen_now = screen(&app);
         assert!(
             screen_now.contains("Board service: socket timed out"),
             "{screen_now}"
         );
         // A later answer shows the state again, as current.
-        app.set_board(Ok(board_state(true)), start + Duration::from_secs(4));
+        app.set_board(Ok(board_state(true)), start + Duration::from_secs(6));
         let screen_now = screen(&app);
         assert!(!screen_now.contains("refreshing"), "{screen_now}");
         assert!(screen_now.contains("F5"), "{screen_now}");

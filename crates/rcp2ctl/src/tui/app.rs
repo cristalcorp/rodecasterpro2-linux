@@ -57,8 +57,9 @@ pub(crate) struct App {
 }
 
 /// How long a failed poll still shows the last state: a busy service is
-/// not worth a flicker, a lasting failure is worth saying.
-const FAILURE_GRACE: Duration = Duration::from_secs(3);
+/// not worth a flicker, a lasting failure is worth saying. Longer than one
+/// poll (1 s apart) that times out (2 s).
+const FAILURE_GRACE: Duration = Duration::from_secs(5);
 
 /// Why the board service could not be asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,11 +78,9 @@ pub(crate) type BoardView = Result<StateDto, BoardIssue>;
 /// What the Console panel shows, decided when an answer arrives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BoardShown {
-    /// The board's state; `refreshing` when it may no longer be current.
-    State {
-        state: StateDto,
-        refreshing: bool,
-    },
+    /// The board's state; marked refreshing when it may no longer be
+    /// current (the board is read again, or the last poll failed).
+    State(StateDto),
     Message(String),
 }
 
@@ -110,8 +109,7 @@ impl App {
                 } else if !state.state_known {
                     BoardShown::Message(BOARD_BEING_READ.to_owned())
                 } else {
-                    let refreshing = state.refreshing;
-                    BoardShown::State { state, refreshing }
+                    BoardShown::State(state)
                 }
             }
             Err(BoardIssue::Other(reason)) => {
@@ -119,8 +117,8 @@ impl App {
                     .last_answer
                     .is_some_and(|last| now.saturating_duration_since(last) < FAILURE_GRACE);
                 match &mut self.board {
-                    BoardShown::State { refreshing, .. } if recent => {
-                        *refreshing = true;
+                    BoardShown::State(state) if recent => {
+                        state.refreshing = true;
                         return;
                     }
                     _ => BoardShown::Message(format!("Board service: {reason}")),
