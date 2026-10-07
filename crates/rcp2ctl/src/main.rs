@@ -1086,8 +1086,23 @@ fn print_board(
     Ok(())
 }
 
+/// Asks the board service, again a few times while it cannot answer now.
+fn query_board() -> Result<daemon::StateDto, daemon::DaemonError> {
+    const ATTEMPTS: u32 = 3;
+    let mut attempt = 1;
+    loop {
+        match daemon::query_state() {
+            Err(err) if err.is_transient() && attempt < ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            answer => return answer,
+        }
+    }
+}
+
 fn board(out: &mut impl Write) -> Result<(), CliError> {
-    let state = daemon::query_state()?;
+    let state = query_board()?;
     if !state.connected {
         writeln!(out, "{BOARD_NOT_CONNECTED}")?;
         return Ok(());

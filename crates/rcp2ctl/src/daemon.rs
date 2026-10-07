@@ -404,12 +404,22 @@ fn serve(listener: &UnixListener, shared: &SharedState) {
             continue;
         }
         let shared = Arc::clone(shared);
-        let active = Arc::clone(&active);
+        let slot = Slot(Arc::clone(&active));
         thread::spawn(move || {
+            // Released even if answering panics.
+            let _slot = slot;
             // A misbehaving client only affects its own connection.
             let _ = answer(stream, &shared);
-            active.fetch_sub(1, Ordering::SeqCst);
         });
+    }
+}
+
+/// One client being served: frees its place when dropped.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -447,8 +457,8 @@ fn check_version(version: u32) -> Result<(), DaemonError> {
 /// [`DaemonError::ServiceNewer`] if it speaks another protocol version.
 pub(crate) fn query_state() -> Result<StateDto, DaemonError> {
     let path = socket_path()?;
-    let mut stream = UnixStream::connect(&path).map_err(|_| DaemonError::NotRunning)?;
     let deadline = Instant::now() + QUERY_TIMEOUT;
+    let mut stream = connect_by(&path, deadline)?;
     stream
         .set_write_timeout(Some(QUERY_TIMEOUT))
         .map_err(io_err(&path))?;
@@ -457,14 +467,41 @@ pub(crate) fn query_state() -> Result<StateDto, DaemonError> {
     parse_answer(&line)
 }
 
-/// A failed exchange: a timeout or a dropped connection means the service
-/// could not answer now; anything else is reported as is.
+/// Connects by `deadline`. A service that no longer accepts (frozen, its
+/// backlog full) makes `connect` wait without limit, so it runs on a helper
+/// thread; at most one such wait is left behind, however often this is
+/// called.
+fn connect_by(path: &Path, deadline: Instant) -> Result<UnixStream, DaemonError> {
+    static WAITING: AtomicUsize = AtomicUsize::new(0);
+    if WAITING.fetch_add(1, Ordering::SeqCst) > 0 {
+        WAITING.fetch_sub(1, Ordering::SeqCst);
+        return Err(DaemonError::NoAnswer);
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let target = path.to_owned();
+    thread::spawn(move || {
+        let _ = sender.send(UnixStream::connect(&target));
+        WAITING.fetch_sub(1, Ordering::SeqCst);
+    });
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(_)) => Err(DaemonError::NotRunning),
+        Err(_) => Err(DaemonError::NoAnswer),
+    }
+}
+
+/// A failed exchange: a timeout means the service could not answer now
+/// (it says so itself when busy); anything else is a broken answer or
+/// reported as is.
 fn answer_err(path: &Path, err: io::Error) -> DaemonError {
     match err.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => DaemonError::NoAnswer,
         io::ErrorKind::ConnectionReset
         | io::ErrorKind::BrokenPipe
-        | io::ErrorKind::UnexpectedEof => DaemonError::Busy,
+        | io::ErrorKind::UnexpectedEof => {
+            DaemonError::BadAnswer("the connection closed before the answer".to_owned())
+        }
+        io::ErrorKind::InvalidData => DaemonError::BadAnswer(err.to_string()),
         _ => io_err(path)(err),
     }
 }
@@ -474,7 +511,8 @@ fn answer_err(path: &Path, err: io::Error) -> DaemonError {
 fn read_answer(stream: &mut UnixStream, deadline: Instant) -> io::Result<String> {
     let mut answer = Vec::new();
     let mut chunk = [0_u8; 4096];
-    while !answer.contains(&b'\n') {
+    let mut complete = false;
+    while !complete {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(io::ErrorKind::TimedOut.into());
@@ -482,7 +520,11 @@ fn read_answer(stream: &mut UnixStream, deadline: Instant) -> io::Result<String>
         stream.set_read_timeout(Some(left))?;
         match stream.read(&mut chunk) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(read) => answer.extend_from_slice(chunk.get(..read).unwrap_or_default()),
+            Ok(read) => {
+                let new = chunk.get(..read).unwrap_or_default();
+                complete = new.contains(&b'\n');
+                answer.extend_from_slice(new);
+            }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err) => return Err(err),
         }
@@ -506,20 +548,19 @@ fn parse_answer(line: &str) -> Result<StateDto, DaemonError> {
     struct Refused {
         error: String,
     }
-    if let Ok(Refused { error }) = serde_json::from_str(line) {
-        return Err(if error == "busy" {
-            DaemonError::Busy
-        } else {
-            DaemonError::BadAnswer(error)
-        });
-    }
     let bad = |err: serde_json::Error| DaemonError::BadAnswer(err.to_string());
-    check_version(
-        serde_json::from_str::<Versioned>(line)
-            .map_err(bad)?
-            .version,
-    )?;
-    serde_json::from_str(line).map_err(bad)
+    match serde_json::from_str::<Versioned>(line) {
+        Ok(Versioned { version }) => {
+            check_version(version)?;
+            serde_json::from_str(line).map_err(bad)
+        }
+        // No version: a refusal, which has no state to give.
+        Err(err) => match serde_json::from_str::<Refused>(line) {
+            Ok(Refused { error }) if error == "busy" => Err(DaemonError::Busy),
+            Ok(Refused { error }) => Err(DaemonError::BadAnswer(error)),
+            Err(_) => Err(bad(err)),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -631,6 +672,15 @@ mod tests {
     #[test]
     fn a_turned_away_client_is_told_to_ask_again() {
         assert!(matches!(parse_answer(BUSY_ANSWER), Err(DaemonError::Busy)));
+        // A state answer with an `error` field is still read by its version.
+        let newer = format!(
+            "{{\"version\":{},\"error\":\"busy\"}}",
+            PROTOCOL_VERSION + 1
+        );
+        assert!(matches!(
+            parse_answer(&newer),
+            Err(DaemonError::ServiceNewer)
+        ));
         assert!(matches!(
             parse_answer("{\"error\":\"unknown request\"}"),
             Err(DaemonError::BadAnswer(_))
@@ -662,9 +712,20 @@ mod tests {
         );
         assert!(matches!(slow, Err(DaemonError::NoAnswer)), "{slow:?}");
         assert!(started.elapsed() < Duration::from_secs(1));
-        // Hung up without a word: the service could not answer now.
+        // Hung up without a word: a broken answer (a busy service says so).
         let dropped = read_from(drop, Duration::from_secs(1));
-        assert!(matches!(dropped, Err(DaemonError::Busy)), "{dropped:?}");
+        assert!(
+            matches!(dropped, Err(DaemonError::BadAnswer(_))),
+            "{dropped:?}"
+        );
+        let garbled = read_from(
+            |mut theirs| theirs.write_all(b"\xff\n").unwrap(),
+            Duration::from_secs(1),
+        );
+        assert!(
+            matches!(garbled, Err(DaemonError::BadAnswer(_))),
+            "{garbled:?}"
+        );
         let whole = read_from(
             |mut theirs| theirs.write_all(b"{}\n").unwrap(),
             Duration::from_secs(1),

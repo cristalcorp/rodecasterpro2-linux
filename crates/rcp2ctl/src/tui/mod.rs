@@ -40,8 +40,12 @@ fn board_view() -> BoardView {
 fn spawn_board_watcher() -> Receiver<BoardPoll> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        // Timed when the poll ends, not when the screen gets to it.
-        while sender.send((Instant::now(), board_view())).is_ok() {
+        loop {
+            let view = board_view();
+            // Timed when the poll ends, not when the screen gets to it.
+            if sender.send((Instant::now(), view)).is_err() {
+                break;
+            }
             thread::sleep(REFRESH_EVERY);
         }
     });

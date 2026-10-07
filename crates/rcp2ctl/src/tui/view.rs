@@ -167,23 +167,28 @@ fn console_heights(board: &BoardShown, message_lines: usize) -> (u16, u16) {
 }
 
 /// A message cut into lines of at most `width` columns, at spaces (a word
-/// longer than a line keeps its own line); nothing for the strips.
+/// longer than a line keeps its own line); nothing for the strips. Done per
+/// frame as it depends on the width, and costs a few words.
 fn console_lines(board: &BoardShown, width: u16) -> Vec<String> {
     let BoardShown::Message(text) = board else {
         return Vec::new();
     };
     let width = usize::from(width.max(1));
     let mut lines: Vec<String> = Vec::new();
+    // Width of the last line, kept rather than measured again per word.
+    let mut used = 0;
     for word in text.split(' ') {
-        let fits = lines.last().is_some_and(|line| {
-            Line::from(line.as_str()).width() + 1 + Line::from(word).width() <= width
-        });
+        let word_width = Span::raw(word).width();
         match lines.last_mut() {
-            Some(line) if fits => {
+            Some(line) if used + 1 + word_width <= width => {
                 line.push(' ');
                 line.push_str(word);
+                used += 1 + word_width;
             }
-            _ => lines.push(word.to_owned()),
+            _ => {
+                lines.push(word.to_owned());
+                used = word_width;
+            }
         }
     }
     lines
