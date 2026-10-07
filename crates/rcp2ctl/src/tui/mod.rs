@@ -32,12 +32,12 @@ fn board_view() -> BoardView {
     crate::daemon::query_state().map_err(|err| match err {
         DaemonError::NotRunning => BoardIssue::NotRunning,
         // Kept short: the console gives a message one line.
-        DaemonError::ServiceOlder => {
-            BoardIssue::Version("older than this rcp2ctl, restart it with this one".to_owned())
-        }
-        DaemonError::ServiceNewer => {
-            BoardIssue::Version("newer than this rcp2ctl, use the newer rcp2ctl".to_owned())
-        }
+        DaemonError::ServiceOlder => BoardIssue::Version(
+            "older than this rcp2ctl, `hid setup` restarts it on this one".to_owned(),
+        ),
+        DaemonError::ServiceNewer => BoardIssue::Version(
+            "newer than this rcp2ctl, run the one it was installed with".to_owned(),
+        ),
         DaemonError::BadAnswer(reason) => BoardIssue::Other(format!("invalid answer: {reason}")),
         err => BoardIssue::Other(err.to_string()),
     })

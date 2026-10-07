@@ -36,8 +36,6 @@ pub(crate) const PROTOCOL_VERSION: u32 = 3;
 /// How long the previous state is still served while a new dump is awaited:
 /// a dump takes a moment, one that never comes must not leave old values.
 const STALE_FOR: Duration = Duration::from_secs(15);
-/// How often the session checks for an overdue or held-back dump request.
-const CHECK_EVERY: Duration = Duration::from_secs(1);
 /// Least time between two requests for a new dump.
 const RESYNC_EVERY: Duration = Duration::from_secs(5);
 /// Notifications kept while waiting for a dump; beyond that, a new dump is
@@ -241,24 +239,19 @@ fn session(mut board: rcp2_hid::Board, shared: &SharedState, log: &mut impl Writ
         return err.to_string();
     }
     lock(shared).connected = true;
-    // A new dump is needed but the rate limit held it back: asked for later.
-    let mut wanted = false;
     loop {
-        let report = match reports.recv_timeout(CHECK_EVERY) {
+        let report = match reports.recv_timeout(RESYNC_EVERY) {
             Ok(Ok(report)) => Some(report),
             Ok(Err(err)) => return format!("read error: {err}"),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return "reader stopped".to_owned(),
         };
-        if let Some(report) = report {
-            wanted |= sync.handle(&report.bytes, shared);
-        }
-        // A dump asked for and still not complete, whatever else arrives.
-        wanted |= lock(shared)
-            .refreshing_since
-            .is_some_and(|since| since.elapsed() >= RESYNC_EVERY);
-        if wanted && sync.may_request() {
-            wanted = false;
+        let needs_resync = match report {
+            Some(report) => sync.handle(&report.bytes, shared),
+            // Quiet board: only a problem if a dump was asked for and never came.
+            None => lock(shared).refreshing_since.is_some(),
+        };
+        if needs_resync && sync.may_request() {
             let _ = writeln!(
                 log,
                 "state copy out of date: asking the board for a new dump"
@@ -328,39 +321,30 @@ impl Tracker {
                     true
                 }
             },
-            // A whole new tree: as good as the dump being waited for.
-            Incoming::Change(Change::FullSync(tree)) => {
-                self.assembler = DumpAssembler::default();
-                self.pending.clear();
-                let mut state = lock(shared);
-                state.tree = Some(tree);
-                state.refreshing_since = None;
-                state.notifications = 0;
-                false
-            }
             Incoming::Change(change) => {
                 let mut state = lock(shared);
-                let awaited =
-                    state.refreshing_since.is_some() || self.assembler.missing().is_some();
-                if !awaited && let Some(tree) = state.tree.as_mut() {
-                    if apply(tree, change) {
-                        state.notifications += 1;
-                        return false;
+                let awaited = state.refreshing_since.is_some();
+                match state.tree.as_mut() {
+                    // The tree being replaced is out of date: keep the change
+                    // for the new one.
+                    Some(tree) if !awaited && self.assembler.missing().is_none() => {
+                        if apply(tree, change) {
+                            state.notifications += 1;
+                            false
+                        } else {
+                            true
+                        }
                     }
-                    return true;
+                    _ => {
+                        drop(state);
+                        if self.pending.len() >= MAX_PENDING {
+                            self.pending.clear();
+                            return true;
+                        }
+                        self.pending.push(change);
+                        false
+                    }
                 }
-                // While a dump is awaited, the change is shown on the served
-                // tree when it fits there, and kept for the new tree.
-                if let Some(tree) = state.tree.as_mut() {
-                    let _ = apply(tree, change.clone());
-                }
-                drop(state);
-                if self.pending.len() >= MAX_PENDING {
-                    self.pending.clear();
-                    return true;
-                }
-                self.pending.push(change);
-                false
             }
             Incoming::Ack | Incoming::Unknown => false,
         }
@@ -468,11 +452,10 @@ fn parse_answer(line: &str) -> Result<StateDto, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonError, PROTOCOL_VERSION, STALE_FOR, Shared, StateDto, Tracker, apply, check_version,
+        DaemonError, PROTOCOL_VERSION, STALE_FOR, Shared, StateDto, apply, check_version,
         parse_answer,
     };
     use rcp2_proto::{Change, Node, Var};
-    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -567,27 +550,5 @@ mod tests {
         );
         assert!(done.state_known);
         assert!(!done.refreshing);
-    }
-
-    #[test]
-    fn a_full_sync_while_a_dump_is_awaited_ends_the_wait() {
-        let shared = Arc::new(Mutex::new(Shared {
-            connected: true,
-            tree: Some(Node::default()),
-            refreshing_since: Some(Instant::now()),
-            notifications: 5,
-        }));
-        // Report 4: length, then the full-sync message (type 2 and a tree).
-        let mut message = vec![2];
-        message.extend(rcp2_proto::encode_tree(&Node::default()));
-        let mut report = vec![rcp2_proto::PROPERTY_IN_REPORT_ID];
-        report.extend(u32::try_from(message.len()).unwrap().to_le_bytes());
-        report.extend(message);
-        let mut tracker = Tracker::default();
-        assert!(!tracker.handle(&report, &shared));
-        let state = StateDto::new(&shared.lock().unwrap(), Instant::now());
-        assert!(state.state_known);
-        assert!(!state.refreshing);
-        assert_eq!(state.notifications, 0);
     }
 }
