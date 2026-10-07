@@ -33,7 +33,11 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
     let (least, wanted) = console_heights(board, lines.len());
     let console_height = if room < least { 0 } else { wanted.min(room) };
     // A message cut short says so on its last line.
-    let lines = cut_lines(lines, usize::from(console_height.saturating_sub(2)));
+    let lines = cut_lines(
+        lines,
+        usize::from(console_height.saturating_sub(2)),
+        usize::from(frame.area().width.saturating_sub(2)),
+    );
     let [header, body, console, message, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(MIN_BODY),
@@ -212,12 +216,14 @@ fn console_lines(board: &BoardShown, width: u16) -> Vec<String> {
 }
 
 /// Keeps the first `rows` lines, the last of them ending with "…" when
-/// some had to go.
-fn cut_lines(mut lines: Vec<String>, rows: usize) -> Vec<String> {
+/// some had to go (a character gives way only if the line is full).
+fn cut_lines(mut lines: Vec<String>, rows: usize, width: usize) -> Vec<String> {
     if lines.len() > rows {
         lines.truncate(rows);
         if let Some(last) = lines.last_mut() {
-            last.pop();
+            if Span::raw(last.as_str()).width() + 1 > width {
+                last.pop();
+            }
             last.push('…');
         }
     }
@@ -580,10 +586,25 @@ mod tests {
     }
 
     #[test]
+    fn an_unplugged_board_leaves_no_fader_on_the_outputs() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.console.record(Ok(board_state(true)), Instant::now());
+        assert!(screen(&app).contains("F5"));
+        let mut unplugged = board_state(false);
+        unplugged.connected = false;
+        app.console.record(Ok(unplugged), Instant::now());
+        let screen = screen(&app);
+        assert!(screen.contains(crate::BOARD_NOT_CONNECTED), "{screen}");
+        assert!(!screen.contains("F5"), "{screen}");
+        assert!(!screen.contains('{'), "{screen}");
+    }
+
+    #[test]
     fn a_message_cut_short_says_so() {
         let lines = vec!["one".to_owned(), "two".to_owned(), "three".to_owned()];
-        assert_eq!(super::cut_lines(lines.clone(), 3), lines);
-        assert_eq!(super::cut_lines(lines, 2), vec!["one", "tw…"]);
+        assert_eq!(super::cut_lines(lines.clone(), 3, 10), lines);
+        assert_eq!(super::cut_lines(lines.clone(), 2, 10), vec!["one", "two…"]);
+        assert_eq!(super::cut_lines(lines, 2, 3), vec!["one", "tw…"]);
     }
 
     #[test]

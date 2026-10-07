@@ -9,13 +9,15 @@ use rcp2_proto::InputSource;
 use crate::daemon::{DaemonError, QUERY_TIMEOUT, StateDto};
 use crate::{BOARD_BEING_READ, BOARD_NOT_CONNECTED};
 
+/// One poll that runs out of time, from the end of the previous one.
+const TIMED_OUT_POLL: Duration = super::REFRESH_EVERY.saturating_add(QUERY_TIMEOUT);
 /// How long the last answer is still shown through polls that fail for a
-/// passing reason: one poll interval and one poll that runs out of time,
-/// then one more of each as margin. Every poll is bounded by
-/// `QUERY_TIMEOUT`, so failures keep being reported meanwhile.
-pub(crate) const ANSWER_GRACE: Duration = super::REFRESH_EVERY
-    .saturating_add(QUERY_TIMEOUT)
-    .saturating_mul(2);
+/// passing reason: two polls that run out of time, and one interval of
+/// margin (polls end a little after their deadline). Every poll is bounded
+/// by `QUERY_TIMEOUT`, so failures keep being reported meanwhile.
+pub(crate) const ANSWER_GRACE: Duration = TIMED_OUT_POLL
+    .saturating_mul(2)
+    .saturating_add(super::REFRESH_EVERY);
 
 const NO_CHANNEL: &str = "No channel is assigned on the board.";
 const ASKING: &str = "Asking the board service…";
@@ -140,7 +142,11 @@ impl Console {
                 {
                     from_state(state, true)
                 }
-                _ => BoardShown::Message(issue.text),
+                _ => {
+                    // Said: what came before no longer stands for the board.
+                    self.answer = None;
+                    BoardShown::Message(issue.text)
+                }
             },
         };
     }
@@ -285,15 +291,28 @@ pub(crate) mod tests {
         let poll = REFRESH_EVERY + QUERY_TIMEOUT;
         console.record(Err(issue(&DaemonError::NoAnswer)), start + poll);
         assert_eq!(refreshing(&console), Some(true));
-        console.record(
-            Err(issue(&DaemonError::Dropped)),
-            start + poll + QUERY_TIMEOUT,
-        );
+        // The second one ends a little after its deadline: still kept.
+        let late = std::time::Duration::from_millis(50);
+        console.record(Err(issue(&DaemonError::NoAnswer)), start + poll * 2 + late);
         assert_eq!(refreshing(&console), Some(true));
         console.record(Err(issue(&DaemonError::NoAnswer)), start + ANSWER_GRACE);
         assert_eq!(text(&console), "The board service did not answer in time.");
         console.record(Ok(board_state(true)), start + ANSWER_GRACE);
         assert_eq!(refreshing(&console), Some(false));
+    }
+
+    #[test]
+    fn a_said_error_is_not_undone_by_a_passing_one() {
+        let start = Instant::now();
+        let mut console = Console::new();
+        console.record(Ok(board_state(true)), start);
+        console.record(Err(issue(&DaemonError::NotRunning)), start + REFRESH_EVERY);
+        // The restarted service does not answer yet: the old strips stay gone.
+        console.record(
+            Err(issue(&DaemonError::NoAnswer)),
+            start + REFRESH_EVERY * 3,
+        );
+        assert_eq!(text(&console), "The board service did not answer in time.");
     }
 
     #[test]
