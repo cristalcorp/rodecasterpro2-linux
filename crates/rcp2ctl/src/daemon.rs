@@ -35,7 +35,9 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 4: a client turned away is told so (`{"error":"busy"}`, no version).
 /// 5: `starting`, while the service has not finished its first look at the
 ///    board.
-pub(crate) const PROTOCOL_VERSION: u32 = 5;
+/// 6: each channel carries its live level; `faders` (whose `faderLevel` is
+///    not the fader's position, I-013) becomes `fader_count`.
+pub(crate) const PROTOCOL_VERSION: u32 = 6;
 /// How long the previous state is still served while a new dump is awaited:
 /// a dump takes a moment, one that never comes must not leave old values.
 const STALE_FOR: Duration = Duration::from_secs(15);
@@ -118,6 +120,8 @@ pub(crate) struct ChannelDto {
     pub(crate) code: Option<i32>,
     /// Output muted, if reported.
     pub(crate) muted: Option<bool>,
+    /// Level set by its fader (0–127), if readable; none for an empty strip.
+    pub(crate) level: Option<i32>,
 }
 
 /// The board state, as sent to clients.
@@ -140,8 +144,8 @@ pub(crate) struct StateDto {
     pub(crate) starting: bool,
     pub(crate) firmware: Option<String>,
     pub(crate) channels: Vec<ChannelDto>,
-    /// One entry per fader; `None` if its level is unreadable.
-    pub(crate) faders: Vec<Option<i32>>,
+    /// Number of physical faders: strip `n` sits on fader `n + 1`.
+    pub(crate) fader_count: usize,
     /// Notifications applied since the last full state dump.
     pub(crate) notifications: u64,
 }
@@ -175,9 +179,10 @@ impl StateDto {
                     source: channel.source.to_string(),
                     code: channel.source.code(),
                     muted: channel.muted,
+                    level: channel.level,
                 })
                 .collect(),
-            faders: state.faders,
+            fader_count: state.fader_count,
             notifications,
         }
     }
@@ -739,6 +744,36 @@ mod tests {
             value: Var::Int(1),
         };
         assert!(!apply(&mut tree, change));
+    }
+
+    /// N2: a moved fader is served without a new dump.
+    #[test]
+    fn a_moved_fader_is_served_at_once() {
+        let node = |name: &str, property: &str, value: Var| Node {
+            name: name.to_owned(),
+            properties: vec![(property.to_owned(), value)],
+            children: vec![],
+        };
+        let mut tree = Node::default();
+        tree.children
+            .push(node("CHANNEL", "channelInputSource", Var::Int(0)));
+        for _ in 0..13 {
+            let level = Var::String("0|0".to_owned());
+            tree.children.push(node("MIX", "mixLevelWithAnchor", level));
+        }
+        let change = Change::PropertyChanged {
+            path: vec![1],
+            name: "mixLevelWithAnchor".to_owned(),
+            value: Var::String("0.2|0.456693".to_owned()),
+        };
+        assert!(apply(&mut tree, change));
+        let shared = Shared {
+            connected: true,
+            tree: Some(tree),
+            ..Shared::default()
+        };
+        let state = StateDto::new(&shared, Instant::now());
+        assert_eq!(state.channels[0].level, Some(58));
     }
 
     #[test]

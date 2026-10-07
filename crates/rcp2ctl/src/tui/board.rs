@@ -246,11 +246,11 @@ fn from_state(state: &StateDto, unanswered: bool) -> BoardShown {
         .enumerate()
         .filter(|(_, channel)| channel.code != empty)
         .map(|(position, channel)| Strip {
-            fader: (position < state.faders.len()).then_some(position + 1),
+            fader: (position < state.fader_count).then_some(position + 1),
             source: channel.source.clone(),
             code: channel.code,
             muted: channel.muted,
-            level: state.faders.get(position).copied().flatten(),
+            level: channel.level,
         })
         .collect();
     if strips.is_empty() {
@@ -274,11 +274,12 @@ pub(crate) mod tests {
     /// A board with every kind of strip: muted, current, empty, unreadable,
     /// past the last fader.
     pub(crate) fn board_state(known: bool) -> StateDto {
-        let strip = |index, source: &str, code, muted| ChannelDto {
+        let strip = |index, source: &str, code, muted, level| ChannelDto {
             index,
             source: source.to_owned(),
             code,
             muted: Some(muted),
+            level,
         };
         StateDto {
             version: PROTOCOL_VERSION,
@@ -289,31 +290,19 @@ pub(crate) mod tests {
             firmware: Some("1.7.6".to_owned()),
             channels: if known {
                 vec![
-                    strip(0x1A, "Mic 1", Some(0), true),
-                    strip(0x1B, "USB 1", Some(7), false),
-                    strip(0x1C, "Chat", Some(8), false),
-                    strip(0x1D, "Music", Some(13), false),
-                    strip(0x1E, "Game", Some(12), false),
-                    strip(0x1F, "(empty)", Some(-1), false),
-                    strip(0x20, "?", None, false),
-                    strip(0x103, "source 9", Some(9), false),
+                    strip(0x1A, "Mic 1", Some(0), true, Some(45)),
+                    strip(0x1B, "USB 1", Some(7), false, Some(26)),
+                    strip(0x1C, "Chat", Some(8), false, Some(28)),
+                    strip(0x1D, "Music", Some(13), false, Some(22)),
+                    strip(0x1E, "Game", Some(12), false, Some(127)),
+                    strip(0x1F, "(empty)", Some(-1), false, None),
+                    strip(0x20, "?", None, false, None),
+                    strip(0x103, "source 9", Some(9), false, Some(0)),
                 ]
             } else {
                 vec![]
             },
-            faders: if known {
-                vec![
-                    Some(45),
-                    Some(26),
-                    Some(28),
-                    Some(22),
-                    Some(127),
-                    Some(0),
-                    None,
-                ]
-            } else {
-                vec![]
-            },
+            fader_count: if known { 7 } else { 0 },
             notifications: 3,
         }
     }

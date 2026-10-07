@@ -70,7 +70,7 @@ enum Command {
         /// Named output.
         channel: Channel,
     },
-    /// Show the board's own state (channels, mutes, faders), read from the
+    /// Show the board's own state (channels, mutes, levels), read from the
     /// board service.
     Board,
     /// Run the board service in the foreground (normally started by systemd,
@@ -113,7 +113,7 @@ enum HidCommand {
         yes: bool,
     },
     /// Decode a capture file offline and show what it says about the board
-    /// (firmware, channels, mutes, faders). Never prints the serial number.
+    /// (firmware, channels, mutes, levels). Never prints the serial number.
     Decode {
         /// A `.rcp2cap` file written by `rcp2ctl hid capture`.
         file: PathBuf,
@@ -978,9 +978,17 @@ fn hid_decode(file: &Path, out: &mut impl Write) -> Result<(), CliError> {
     let channels: Vec<_> = state
         .channels
         .iter()
-        .map(|channel| (channel.index, channel.source.to_string(), channel.muted))
+        .map(|channel| {
+            let level = level_label(channel.source.code(), channel.level);
+            (
+                channel.index,
+                channel.source.to_string(),
+                channel.muted,
+                level,
+            )
+        })
         .collect();
-    print_board(out, state.firmware.as_deref(), &channels, &state.faders)
+    print_board(out, state.firmware.as_deref(), &channels)
 }
 
 /// Runs `program <args>` in the terminal (`sudo` may ask for the password).
@@ -1060,6 +1068,21 @@ pub(crate) const fn mute_label(muted: Option<bool>) -> &'static str {
     }
 }
 
+/// A 0–127 level as a percentage, for display only (levels stay 0–127
+/// everywhere else).
+pub(crate) fn level_percent(level: i32) -> i32 {
+    (level.clamp(0, 127) * 100 + 63) / 127
+}
+
+/// How a channel's level is shown: `—` for an empty strip, `?` if unreadable.
+fn level_label(code: Option<i32>, level: Option<i32>) -> String {
+    match level {
+        Some(level) => format!("{}%", level_percent(level)),
+        None if code == rcp2_proto::InputSource::Empty.code() => "—".to_owned(),
+        None => "?".to_owned(),
+    }
+}
+
 /// Shown while the board service has no state to give.
 pub(crate) const BOARD_NOT_CONNECTED: &str =
     "Board service running, but the board is not connected.";
@@ -1070,19 +1093,17 @@ pub(crate) const BOARD_BEING_READ: &str = "Board connected; its state is being r
 fn print_board(
     out: &mut impl Write,
     firmware: Option<&str>,
-    channels: &[(usize, String, Option<bool>)],
-    faders: &[Option<i32>],
+    channels: &[(usize, String, Option<bool>, String)],
 ) -> Result<(), CliError> {
     writeln!(out, "Firmware: {}", firmware.unwrap_or("(not reported)"))?;
-    writeln!(out, "Channels (tree index, source, output):")?;
-    for (index, source, muted) in channels {
-        writeln!(out, "  0x{index:03x}  {source:<10}  {}", mute_label(*muted))?;
+    writeln!(out, "Channels (tree index, source, output, level):")?;
+    for (index, source, muted, level) in channels {
+        writeln!(
+            out,
+            "  0x{index:03x}  {source:<10}  {:<5}  {level}",
+            mute_label(*muted)
+        )?;
     }
-    let faders: Vec<String> = faders
-        .iter()
-        .map(|level| level.map_or_else(|| "?".to_owned(), |level| level.to_string()))
-        .collect();
-    writeln!(out, "Faders (0-127): {}", faders.join(" "))?;
     Ok(())
 }
 
@@ -1116,9 +1137,12 @@ fn board(out: &mut impl Write) -> Result<(), CliError> {
     let channels: Vec<_> = state
         .channels
         .iter()
-        .map(|channel| (channel.index, channel.source.clone(), channel.muted))
+        .map(|channel| {
+            let level = level_label(channel.code, channel.level);
+            (channel.index, channel.source.clone(), channel.muted, level)
+        })
         .collect();
-    print_board(out, state.firmware.as_deref(), &channels, &state.faders)?;
+    print_board(out, state.firmware.as_deref(), &channels)?;
     if state.refreshing {
         writeln!(out, "(Previous state: the board is being read again.)")?;
     } else {
@@ -1206,4 +1230,37 @@ fn join_ids(ids: &[u32]) -> String {
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{level_label, level_percent, print_board};
+
+    #[test]
+    fn levels_are_shown_as_percentages() {
+        assert_eq!(level_percent(0), 0);
+        assert_eq!(level_percent(45), 35);
+        assert_eq!(level_percent(64), 50);
+        assert_eq!(level_percent(127), 100);
+        // N1, N3, N4.
+        assert_eq!(level_label(Some(7), Some(127)), "100%");
+        assert_eq!(level_label(Some(-1), None), "—");
+        assert_eq!(level_label(Some(7), None), "?");
+        assert_eq!(level_label(None, None), "?");
+    }
+
+    #[test]
+    fn the_board_shows_one_level_per_channel() {
+        let channels = [
+            (0x1A, "Mic 1".to_owned(), Some(true), "35%".to_owned()),
+            (0x20, "(empty)".to_owned(), Some(false), "—".to_owned()),
+        ];
+        let mut out = Vec::new();
+        print_board(&mut out, Some("1.7.6"), &channels).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("  0x01a  Mic 1       muted  35%\n"), "{text}");
+        assert!(text.contains("  0x020  (empty)     on     —\n"), "{text}");
+        // N6: no line of `faderLevel` values.
+        assert!(!text.contains("Faders"), "{text}");
+    }
 }
