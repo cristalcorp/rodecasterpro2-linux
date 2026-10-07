@@ -13,8 +13,8 @@ use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -460,30 +460,56 @@ pub(crate) fn query_state() -> Result<StateDto, DaemonError> {
     let deadline = Instant::now() + QUERY_TIMEOUT;
     let mut stream = connect_by(&path, deadline)?;
     stream
-        .set_write_timeout(Some(QUERY_TIMEOUT))
+        .set_write_timeout(Some(time_left(deadline)?))
         .map_err(io_err(&path))?;
-    writeln!(stream, "state").map_err(|err| answer_err(&path, err))?;
+    // A busy service answers and hangs up without reading: the request may
+    // then fail to go out, but its answer is there to read.
+    if let Err(err) = writeln!(stream, "state")
+        && !matches!(
+            err.kind(),
+            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+        )
+    {
+        return Err(answer_err(&path, err));
+    }
     let line = read_answer(&mut stream, deadline).map_err(|err| answer_err(&path, err))?;
     parse_answer(&line)
 }
 
+/// Time left before `deadline`, if any: none is no answer in time.
+fn time_left(deadline: Instant) -> Result<Duration, DaemonError> {
+    Some(deadline.saturating_duration_since(Instant::now()))
+        .filter(|left| !left.is_zero())
+        .ok_or(DaemonError::NoAnswer)
+}
+
+/// A connection wanted by a deadline, and where to send it.
+type ConnectRequest = (PathBuf, Instant, mpsc::Sender<io::Result<UnixStream>>);
+
 /// Connects by `deadline`. A service that no longer accepts (frozen, its
-/// backlog full) makes `connect` wait without limit, so it runs on a helper
-/// thread; at most one such wait is left behind, however often this is
-/// called.
+/// backlog full) makes `connect` wait without limit, so connections are made
+/// by one long-lived thread; requests whose deadline passed while it was
+/// stuck are dropped, not replayed at the service once it is back.
 fn connect_by(path: &Path, deadline: Instant) -> Result<UnixStream, DaemonError> {
-    static WAITING: AtomicUsize = AtomicUsize::new(0);
-    if WAITING.fetch_add(1, Ordering::SeqCst) > 0 {
-        WAITING.fetch_sub(1, Ordering::SeqCst);
-        return Err(DaemonError::NoAnswer);
-    }
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let target = path.to_owned();
-    thread::spawn(move || {
-        let _ = sender.send(UnixStream::connect(&target));
-        WAITING.fetch_sub(1, Ordering::SeqCst);
+    static CONNECTOR: OnceLock<Mutex<mpsc::Sender<ConnectRequest>>> = OnceLock::new();
+    let connector = CONNECTOR.get_or_init(|| {
+        let (requests, queue) = mpsc::channel::<ConnectRequest>();
+        thread::spawn(move || {
+            for (path, deadline, reply) in queue {
+                if Instant::now() < deadline {
+                    let _ = reply.send(UnixStream::connect(&path));
+                }
+            }
+        });
+        Mutex::new(requests)
     });
-    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+    let (reply, answer) = mpsc::channel();
+    connector
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .send((path.to_owned(), deadline, reply))
+        .map_err(|_| DaemonError::NoAnswer)?;
+    match answer.recv_timeout(time_left(deadline)?) {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(_)) => Err(DaemonError::NotRunning),
         Err(_) => Err(DaemonError::NoAnswer),
@@ -522,8 +548,13 @@ fn read_answer(stream: &mut UnixStream, deadline: Instant) -> io::Result<String>
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(read) => {
                 let new = chunk.get(..read).unwrap_or_default();
-                complete = new.contains(&b'\n');
-                answer.extend_from_slice(new);
+                // One line: whatever follows it is not part of the answer.
+                let line = new
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(new, |end| new.get(..=end).unwrap_or(new));
+                complete = line.ends_with(b"\n");
+                answer.extend_from_slice(line);
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err) => return Err(err),
@@ -727,7 +758,7 @@ mod tests {
             "{garbled:?}"
         );
         let whole = read_from(
-            |mut theirs| theirs.write_all(b"{}\n").unwrap(),
+            |mut theirs| theirs.write_all(b"{}\nmore\n").unwrap(),
             Duration::from_secs(1),
         );
         assert_eq!(whole.unwrap(), "{}\n");

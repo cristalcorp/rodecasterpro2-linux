@@ -177,18 +177,30 @@ fn console_lines(board: &BoardShown, width: u16) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     // Width of the last line, kept rather than measured again per word.
     let mut used = 0;
-    for word in text.split(' ') {
+    // Any whitespace (line breaks and tabs included) separates words.
+    for word in text.split_whitespace() {
         let word_width = Span::raw(word).width();
-        match lines.last_mut() {
-            Some(line) if used + 1 + word_width <= width => {
+        if lines.last().is_some() && used + 1 + word_width <= width {
+            if let Some(line) = lines.last_mut() {
                 line.push(' ');
                 line.push_str(word);
-                used += 1 + word_width;
             }
-            _ => {
-                lines.push(word.to_owned());
-                used = word_width;
+            used += 1 + word_width;
+            continue;
+        }
+        // A new line; a word wider than a line is broken across lines.
+        lines.push(String::new());
+        used = 0;
+        for ch in word.chars() {
+            let ch_width = Span::raw(ch.to_string()).width();
+            if used > 0 && used + ch_width > width {
+                lines.push(String::new());
+                used = 0;
             }
+            if let Some(line) = lines.last_mut() {
+                line.push(ch);
+            }
+            used += ch_width;
         }
     }
     lines
@@ -373,7 +385,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_BODY, Mode, keys_text, render};
+    use super::{BoardShown, MIN_BODY, Mode, keys_text, render};
     use crate::daemon::DaemonError;
     use crate::tui::app::{App, Focus};
     use crate::tui::board::BoardIssue;
@@ -547,6 +559,15 @@ mod tests {
         let squeezed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let shown = squeezed(&text.replace('│', " "));
         assert!(shown.contains(&squeezed(&issue.text)), "{shown}");
+    }
+
+    #[test]
+    fn wrapping_handles_breaks_and_long_words() {
+        let board = BoardShown::Message("ab\ncd\tefghijkl m".to_owned());
+        assert_eq!(
+            super::console_lines(&board, 5),
+            vec!["ab cd", "efghi", "jkl m"]
+        );
     }
 
     #[test]

@@ -9,13 +9,23 @@ use rcp2_proto::InputSource;
 use crate::daemon::{DaemonError, QUERY_TIMEOUT, StateDto};
 use crate::{BOARD_BEING_READ, BOARD_NOT_CONNECTED};
 
+/// When the next answer is due at the latest: one poll interval, then a
+/// poll that runs out of time. Past it the last answer is marked refreshing.
+pub(crate) const ANSWER_DUE: Duration = super::REFRESH_EVERY.saturating_add(QUERY_TIMEOUT);
 /// How long the last answer is still shown when no newer one has come: one
-/// poll interval, one poll that runs out of time, and one more as margin.
-/// Past it the panel says the service does not answer, even if the poll
-/// itself is stuck and never reports.
-pub(crate) const ANSWER_GRACE: Duration = super::REFRESH_EVERY
-    .saturating_add(QUERY_TIMEOUT)
-    .saturating_add(QUERY_TIMEOUT);
+/// more poll as margin. Past it the panel says the service does not answer,
+/// even if the poll itself is stuck and never reports.
+pub(crate) const ANSWER_GRACE: Duration = ANSWER_DUE.saturating_add(QUERY_TIMEOUT);
+
+/// How old the last answer (or the asking, before any) is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Age {
+    Current,
+    /// The next answer is late: shown, marked refreshing.
+    Late,
+    /// Too late: no longer shown.
+    Expired,
+}
 
 const NO_CHANNEL: &str = "No channel is assigned on the board.";
 const ASKING: &str = "Asking the board service…";
@@ -113,8 +123,8 @@ pub(crate) struct Console {
     failure: Option<BoardIssue>,
     /// When the asking started.
     since: Instant,
-    /// Whether the last answer was still recent at the last look.
-    recent: bool,
+    /// The age at the last look: the panel changes only when it does.
+    age: Age,
     shown: BoardShown,
 }
 
@@ -124,7 +134,7 @@ impl Console {
             answer: None,
             failure: None,
             since: now,
-            recent: true,
+            age: Age::Current,
             shown: BoardShown::Message(ASKING.to_owned()),
         }
     }
@@ -142,40 +152,49 @@ impl Console {
             }
             Err(issue) => self.failure = Some(issue),
         }
-        self.recent = self.is_recent(ended);
+        self.age = self.age_at(ended);
         self.shown = self.decide();
     }
 
     /// Looks at the time: an answer too old means the service no longer
     /// answers, even when no poll reports it. Cheap when nothing changes.
     pub(crate) fn tick(&mut self, now: Instant) {
-        let recent = self.is_recent(now);
-        if recent != self.recent {
-            self.recent = recent;
+        let age = self.age_at(now);
+        if age != self.age {
+            self.age = age;
             self.shown = self.decide();
         }
     }
 
-    fn is_recent(&self, now: Instant) -> bool {
+    fn age_at(&self, now: Instant) -> Age {
         let last = self.answer.as_ref().map_or(self.since, |(at, _)| *at);
-        now.saturating_duration_since(last) < ANSWER_GRACE
+        match now.saturating_duration_since(last) {
+            age if age < ANSWER_DUE => Age::Current,
+            age if age < ANSWER_GRACE => Age::Late,
+            _ => Age::Expired,
+        }
     }
 
     fn decide(&self) -> BoardShown {
-        let message = |text: &str| BoardShown::Message(text.to_owned());
+        let expired = self.age == Age::Expired;
         match (&self.failure, &self.answer) {
-            // A lasting failure, or one not worth waiting through, is said.
-            (Some(issue), _) if !issue.transient || !self.recent => message(&issue.text),
-            (Some(issue), None) => message(&issue.text),
-            (failure, Some((_, state))) if self.recent => from_state(state, failure.is_some()),
-            (None, None) if self.recent => message(ASKING),
+            // A lasting failure, one not worth waiting through, or one with
+            // nothing to keep showing, is said.
+            (Some(issue), answer) if !issue.transient || expired || answer.is_none() => {
+                BoardShown::Message(issue.text.clone())
+            }
+            (failure, Some((_, state))) if !expired => {
+                from_state(state, failure.is_some() || self.age == Age::Late)
+            }
+            (None, None) if !expired => BoardShown::Message(ASKING.to_owned()),
             // Nothing for too long: the poll itself is stuck.
             _ => BoardShown::Message(sentence(&DaemonError::NoAnswer.to_string())),
         }
     }
 }
 
-/// The panel for an answer; `unanswered` when later polls failed.
+/// The panel for an answer; `unanswered` when later polls failed or the
+/// next answer is late.
 fn from_state(state: &StateDto, unanswered: bool) -> BoardShown {
     if !state.connected {
         return BoardShown::Message(BOARD_NOT_CONNECTED.to_owned());
@@ -208,7 +227,7 @@ fn from_state(state: &StateDto, unanswered: bool) -> BoardShown {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{ANSWER_GRACE, BoardIssue, BoardShown, Console};
+    use super::{ANSWER_DUE, ANSWER_GRACE, BoardIssue, BoardShown, Console};
     use crate::daemon::{ChannelDto, DaemonError, PROTOCOL_VERSION, QUERY_TIMEOUT, StateDto};
     use crate::tui::REFRESH_EVERY;
     use rcp2_audio::Channel;
@@ -288,6 +307,14 @@ pub(crate) mod tests {
         );
         assert!(older.text.contains("`rcp2ctl hid setup`"));
         assert!(!older.transient);
+        let not_running = issue(&DaemonError::NotRunning);
+        assert!(
+            not_running
+                .text
+                .contains("`rcp2ctl hid setup` installs and starts it")
+        );
+        assert!(not_running.text.ends_with(')'));
+        assert!(!not_running.transient);
         assert!(issue(&DaemonError::Busy).transient);
         assert!(issue(&DaemonError::NoAnswer).transient);
         assert_eq!(
@@ -338,6 +365,8 @@ pub(crate) mod tests {
         // No poll ever reports again.
         console.tick(start + QUERY_TIMEOUT);
         assert_eq!(refreshing(&console), Some(false));
+        console.tick(start + ANSWER_DUE);
+        assert_eq!(refreshing(&console), Some(true));
         console.tick(start + ANSWER_GRACE);
         assert_eq!(text(&console), "The board service did not answer in time.");
         // Same from the start, before any answer.
