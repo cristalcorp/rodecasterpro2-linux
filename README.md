@@ -355,6 +355,11 @@ directory (`$XDG_RUNTIME_DIR/rodecasterpro2-linux/board.sock`, mode 0600):
 only your user can talk to it. It is read-only: it never writes a setting to
 the board.
 
+Only one service runs at a time: it holds a lock file next to the socket, and a
+second one refuses to start. If the service crashes, systemd starts it again
+after 2 seconds; meanwhile, and while it reads the board again, the TUI keeps
+showing the last state, marked "refreshing".
+
 It runs the binary that installed it: if you move or rebuild `rcp2ctl`
 elsewhere, or after upgrading, run `rcp2ctl hid setup` again. `rcp2ctl status`
 tells you when the installed service was written by an older version.
@@ -386,7 +391,8 @@ firmware 1.6.8: fader positions and mute states match the board.
 | Per-application output memory, default output (WirePlumber state) | `route`, `default` | your desktop's sound settings |
 | `/etc/udev/rules.d/70-rodecaster-pro-2.rules` | `hid setup` | `uninstall` |
 | `~/.config/systemd/user/rodecasterpro2-linux.service` (board service) | `hid setup` | `uninstall` |
-| `$XDG_RUNTIME_DIR/rodecasterpro2-linux/board.sock` (in memory) | while the service runs | stopping the service, logout |
+| `$XDG_RUNTIME_DIR/rodecasterpro2-linux/board.sock` (in memory) | while the service runs | replaced at the next start, logout |
+| `$XDG_RUNTIME_DIR/rodecasterpro2-linux/board.lock` (in memory, empty) | while the service runs | logout |
 | `$XDG_RUNTIME_DIR/rodecasterpro2-linux/outputs.lock` (in memory, empty) | any command creating or removing outputs | logout |
 | Your `.rcp2cap` capture files | `hid capture` | delete them yourself |
 

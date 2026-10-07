@@ -33,12 +33,23 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 2: channels carry their source code, fader levels may be unreadable.
 /// 3: the previous state is kept, marked refreshing, while a new dump is read.
 /// 4: a client turned away is told so (`{"error":"busy"}`, no version).
-pub(crate) const PROTOCOL_VERSION: u32 = 4;
+/// 5: `starting`, while the service has not finished its first look at the
+///    board.
+pub(crate) const PROTOCOL_VERSION: u32 = 5;
 /// How long the previous state is still served while a new dump is awaited:
 /// a dump takes a moment, one that never comes must not leave old values.
 const STALE_FOR: Duration = Duration::from_secs(15);
 /// Least time between two requests for a new dump.
 const RESYNC_EVERY: Duration = Duration::from_secs(5);
+/// A dump awaited with no chunk for this long has stopped (or never
+/// started): it is asked for again. A dump (90 to 140 KB depending on the
+/// firmware) is a few hundred chunks read as they come; this margin is not
+/// measured.
+const CHUNK_SILENCE: Duration = Duration::from_secs(2);
+/// How often the session looks at the time when the board is quiet.
+const TICK: Duration = Duration::from_millis(250);
+/// Lock file next to the socket: held by the running instance.
+const LOCK_NAME: &str = "board.lock";
 /// Notifications kept while waiting for a dump; beyond that, a new dump is
 /// needed anyway.
 const MAX_PENDING: usize = 1024;
@@ -111,6 +122,10 @@ pub(crate) struct ChannelDto {
 
 /// The board state, as sent to clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent flags of the socket protocol, read by clients one by one"
+)]
 pub(crate) struct StateDto {
     pub(crate) version: u32,
     /// A session with the board is open.
@@ -120,6 +135,9 @@ pub(crate) struct StateDto {
     pub(crate) state_known: bool,
     /// The state is the previous one: a new dump is being read.
     pub(crate) refreshing: bool,
+    /// The service has not finished its first look at the board (searching
+    /// it, or reading its first dump); bounded by [`STALE_FOR`].
+    pub(crate) starting: bool,
     pub(crate) firmware: Option<String>,
     pub(crate) channels: Vec<ChannelDto>,
     /// One entry per fader; `None` if its level is unreadable.
@@ -134,17 +152,20 @@ impl StateDto {
             connected,
             ref tree,
             refreshing_since,
+            starting_since,
             notifications,
         } = *shared;
-        let tree = tree.as_ref().filter(|_| {
-            refreshing_since.is_none_or(|since| now.saturating_duration_since(since) < STALE_FOR)
-        });
+        let recent = |since: Instant| now.saturating_duration_since(since) < STALE_FOR;
+        let tree = tree
+            .as_ref()
+            .filter(|_| refreshing_since.is_none_or(recent));
         let state = tree.map(BoardState::from_tree).unwrap_or_default();
         Self {
             version: PROTOCOL_VERSION,
             connected,
             state_known: tree.is_some(),
             refreshing: tree.is_some() && refreshing_since.is_some(),
+            starting: starting_since.is_some_and(recent),
             firmware: state.firmware,
             channels: state
                 .channels
@@ -168,8 +189,12 @@ struct Shared {
     connected: bool,
     /// The last complete state, kept while a new dump is read.
     tree: Option<Node>,
-    /// When a new dump was asked for, until it is complete.
+    /// Since when the tree is not the board's: a new dump was asked for, or
+    /// its shape is unsure. Until a new dump is in.
     refreshing_since: Option<Instant>,
+    /// When the service started, until its first look at the board is over
+    /// (first dump in, board not found, or session ended).
+    starting_since: Option<Instant>,
     notifications: u64,
 }
 
@@ -189,7 +214,8 @@ fn lock(shared: &SharedState) -> std::sync::MutexGuard<'_, Shared> {
 /// Returns [`DaemonError`] if the socket cannot be set up or another
 /// instance is running.
 pub(crate) fn run(log: &mut impl Write) -> Result<(), DaemonError> {
-    let listener = bind(&socket_path()?)?;
+    // Held for as long as the service runs.
+    let (_lock, listener) = bind(&socket_path()?)?;
     if let Ok(crate::service::UnitState::Outdated) =
         crate::service::unit_path().and_then(|path| crate::service::unit_state(&path))
     {
@@ -198,7 +224,10 @@ pub(crate) fn run(log: &mut impl Write) -> Result<(), DaemonError> {
             "this unit was written by an older version: run `rcp2ctl hid setup` to update it"
         );
     }
-    let shared = SharedState::default();
+    let shared = SharedState::new(Mutex::new(Shared {
+        starting_since: Some(Instant::now()),
+        ..Shared::default()
+    }));
     let server_state = Arc::clone(&shared);
     thread::spawn(move || serve(&listener, &server_state));
     thread::spawn(|| crate::keeper::run(&mut io::stderr()));
@@ -212,44 +241,48 @@ pub(crate) fn run(log: &mut impl Write) -> Result<(), DaemonError> {
                 let _ = writeln!(log, "board found at {}: opening a session", path.display());
                 let reason = session(board, &shared, log);
                 let _ = writeln!(log, "session ended: {reason}");
+                // Starting is over too.
                 *lock(&shared) = Shared::default();
             }
-            Err(rcp2_hid::HidError::NotFound) => {}
             Err(err) => {
-                let _ = writeln!(log, "{err}");
+                // No board to read: the first look is over.
+                lock(&shared).starting_since = None;
+                if !matches!(err, rcp2_hid::HidError::NotFound) {
+                    let _ = writeln!(log, "{err}");
+                }
             }
         }
         thread::sleep(RECONNECT_EVERY);
     }
 }
 
-/// Binds the socket in a private directory, replacing a stale socket but
-/// refusing to start next to a running instance.
-fn bind(path: &Path) -> Result<UnixListener, DaemonError> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(io_err(dir))?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_err(dir))?;
+/// Takes the instance lock, then binds the socket in a private directory,
+/// replacing one left by a killed instance. The lock (released by the
+/// kernel when the process ends, however it ends) is what tells a running
+/// instance, frozen or not, from a leftover socket.
+fn bind(path: &Path) -> Result<(fs::File, UnixListener), DaemonError> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("/"));
+    fs::create_dir_all(dir).map_err(io_err(dir))?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_err(dir))?;
+    let lock_path = dir.join(LOCK_NAME);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(io_err(&lock_path))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            return Err(DaemonError::AlreadyRunning(path.to_owned()));
+        }
+        Err(fs::TryLockError::Error(err)) => return Err(io_err(&lock_path)(err)),
     }
     if let Ok(meta) = fs::symlink_metadata(path) {
+        // Not ours to remove.
         if !meta.file_type().is_socket() {
             return Err(DaemonError::AlreadyRunning(path.to_owned()));
         }
-        match connect_now(path) {
-            // Someone listens, even frozen (its backlog full).
-            Ok(_) => return Err(DaemonError::AlreadyRunning(path.to_owned())),
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                return Err(DaemonError::AlreadyRunning(path.to_owned()));
-            }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-                ) => {}
-            // Could not tell (out of files, path too long…): said, not guessed.
-            Err(err) => return Err(io_err(path)(err)),
-        }
-        // A socket nobody listens on: left over by a killed instance (or
-        // already gone).
         match fs::remove_file(path) {
             Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(io_err(path)(err)),
             _ => {}
@@ -257,7 +290,7 @@ fn bind(path: &Path) -> Result<UnixListener, DaemonError> {
     }
     let listener = UnixListener::bind(path).map_err(io_err(path))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(io_err(path))?;
-    Ok(listener)
+    Ok((lock, listener))
 }
 
 /// One session with the board, until it is unplugged or a read fails.
@@ -267,118 +300,155 @@ fn session(mut board: rcp2_hid::Board, shared: &SharedState, log: &mut impl Writ
         Err(err) => return err.to_string(),
     };
     let mut sync = Tracker::default();
-    if let Err(err) = sync.request(&mut board, shared) {
+    sync.start_request(shared, Instant::now());
+    if let Err(err) = board.handshake() {
         return err.to_string();
     }
     lock(shared).connected = true;
     loop {
-        let report = match reports.recv_timeout(RESYNC_EVERY) {
-            Ok(Ok(report)) => Some(report),
+        match reports.recv_timeout(TICK) {
+            Ok(Ok(report)) => sync.handle(&report.bytes, shared, Instant::now()),
             Ok(Err(err)) => return format!("read error: {err}"),
-            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return "reader stopped".to_owned(),
-        };
-        let needs_resync = match report {
-            Some(report) => sync.handle(&report.bytes, shared),
-            // Quiet board: only a problem if a dump was asked for and never came.
-            None => lock(shared).refreshing_since.is_some(),
-        };
-        if needs_resync && sync.may_request() {
+        }
+        let now = Instant::now();
+        if sync.due(now) {
             let _ = writeln!(
                 log,
                 "state copy out of date: asking the board for a new dump"
             );
-            if let Err(err) = sync.request(&mut board, shared) {
+            sync.start_request(shared, now);
+            if let Err(err) = board.handshake() {
                 return err.to_string();
             }
         }
     }
 }
 
-/// Keeps the copy of the board state in step with the board.
+/// Keeps the copy of the board state in step with the board. Told the time
+/// rather than reading it, so its rules are tested without a board.
 #[derive(Default)]
 struct Tracker {
     assembler: DumpAssembler,
-    /// Property changes received while a dump is awaited, for the new tree.
+    /// Property changes received while the tree is not the board's, for the
+    /// new one.
     pending: Vec<Change>,
     last_request: Option<Instant>,
+    /// A new dump is needed: asked for as soon as the rate limit allows,
+    /// and once the dump being read is in.
+    wanted: bool,
+    /// While a dump is awaited: when it last showed progress (asked for, or
+    /// a chunk received).
+    progress: Option<Instant>,
 }
 
 impl Tracker {
-    /// Asks for a full dump (the handshake), forgetting partial data; the
-    /// current tree is still served, as refreshing, until the dump is in.
-    fn request(
-        &mut self,
-        board: &mut rcp2_hid::Board,
-        shared: &SharedState,
-    ) -> Result<(), rcp2_hid::HidError> {
+    /// Records that a full dump (the handshake) is being asked for,
+    /// forgetting partial data; the current tree is still served, as
+    /// refreshing, until the dump is in.
+    fn start_request(&mut self, shared: &SharedState, now: Instant) {
         self.assembler = DumpAssembler::default();
         self.pending.clear();
-        let now = Instant::now();
         self.last_request = Some(now);
+        self.progress = Some(now);
+        self.wanted = false;
         lock(shared).refreshing_since.get_or_insert(now);
-        board.handshake()
     }
 
-    /// Rate limit: at most one request every [`RESYNC_EVERY`].
-    fn may_request(&self) -> bool {
-        self.last_request
-            .is_none_or(|last| last.elapsed() >= RESYNC_EVERY)
+    /// Whether to ask for a new dump now: one is needed, or the awaited one
+    /// has gone silent; never while one is arriving, and at most one request
+    /// every [`RESYNC_EVERY`].
+    fn due(&self, now: Instant) -> bool {
+        let arriving = self
+            .progress
+            .is_some_and(|at| now.saturating_duration_since(at) < CHUNK_SILENCE);
+        let silent = self.progress.is_some() && !arriving;
+        let allowed = self
+            .last_request
+            .is_none_or(|last| now.saturating_duration_since(last) >= RESYNC_EVERY);
+        !arriving && (self.wanted || silent) && allowed
     }
 
-    /// Handles one report; `true` if the copy is out of date.
-    fn handle(&mut self, report: &[u8], shared: &SharedState) -> bool {
+    /// The copy is out of date: its shape is unsure, so nothing more is
+    /// applied to it (changes wait for a new dump) and it is served as
+    /// refreshing until one is in.
+    fn need(&mut self, shared: &SharedState, now: Instant) {
+        self.wanted = true;
+        lock(shared).refreshing_since.get_or_insert(now);
+    }
+
+    /// Handles one report.
+    fn handle(&mut self, report: &[u8], shared: &SharedState, now: Instant) {
         match classify(report) {
-            Incoming::DumpChunk(chunk) => match self.assembler.push(chunk) {
-                Ok(Some(mut tree)) => {
-                    let mut applied = 0;
-                    let mut fits = true;
-                    for change in self.pending.drain(..) {
-                        if apply(&mut tree, change) {
-                            applied += 1;
-                        } else {
-                            fits = false;
-                        }
+            Incoming::DumpChunk(chunk) => self.chunk(chunk, shared, now),
+            Incoming::Change(change) => self.change(change, shared, now),
+            Incoming::Ack | Incoming::Unknown => {}
+        }
+    }
+
+    fn chunk(&mut self, chunk: &[u8], shared: &SharedState, now: Instant) {
+        match self.assembler.push(chunk) {
+            Ok(Some(mut tree)) => {
+                let mut applied = 0;
+                let mut fits = true;
+                for change in self.pending.drain(..) {
+                    // Once one does not fit, the shape is unsure: stop.
+                    if fits && apply(&mut tree, change) {
+                        applied += 1;
+                    } else {
+                        fits = false;
                     }
-                    let mut state = lock(shared);
-                    state.tree = Some(tree);
-                    state.refreshing_since = None;
-                    state.notifications = applied;
-                    !fits
                 }
-                Ok(None) => false,
-                // A chunk that belongs to no dump: our view of the stream is off.
-                Err(_) => {
-                    self.assembler = DumpAssembler::default();
-                    true
-                }
-            },
-            Incoming::Change(change) => {
+                self.progress = None;
                 let mut state = lock(shared);
-                let awaited = state.refreshing_since.is_some();
-                match state.tree.as_mut() {
-                    // The tree being replaced is out of date: keep the change
-                    // for the new one.
-                    Some(tree) if !awaited && self.assembler.missing().is_none() => {
-                        if apply(tree, change) {
-                            state.notifications += 1;
-                            false
-                        } else {
-                            true
-                        }
-                    }
-                    _ => {
-                        drop(state);
-                        if self.pending.len() >= MAX_PENDING {
-                            self.pending.clear();
-                            return true;
-                        }
-                        self.pending.push(change);
-                        false
-                    }
+                state.tree = Some(tree);
+                state.refreshing_since = None;
+                state.starting_since = None;
+                state.notifications = applied;
+                drop(state);
+                // Changes lost (queue full) are not in it either.
+                if !fits || self.wanted {
+                    self.need(shared, now);
                 }
             }
-            Incoming::Ack | Incoming::Unknown => false,
+            Ok(None) => {
+                if self.progress.is_some() {
+                    self.progress = Some(now);
+                }
+            }
+            // A chunk that belongs to no dump: our view of the stream is off.
+            Err(_) => {
+                self.assembler = DumpAssembler::default();
+                self.need(shared, now);
+            }
+        }
+    }
+
+    fn change(&mut self, change: Change, shared: &SharedState, now: Instant) {
+        let mut state = lock(shared);
+        let sure = state.refreshing_since.is_none() && self.assembler.missing().is_none();
+        match state.tree.as_mut() {
+            Some(tree) if sure => {
+                if apply(tree, change) {
+                    state.notifications += 1;
+                } else {
+                    drop(state);
+                    self.need(shared, now);
+                }
+            }
+            // The tree being replaced is out of date: keep the change for
+            // the new one.
+            _ => {
+                drop(state);
+                if self.pending.len() >= MAX_PENDING {
+                    // Lost changes: the dump being read will not be enough.
+                    self.pending.clear();
+                    self.need(shared, now);
+                } else {
+                    self.pending.push(change);
+                }
+            }
         }
     }
 }
@@ -611,8 +681,9 @@ fn parse_answer(line: &str) -> Result<StateDto, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BUSY_ANSWER, DaemonError, PROTOCOL_VERSION, QUERY_TIMEOUT, STALE_FOR, Shared, StateDto,
-        answer_err, apply, check_version, connect, exchange, parse_answer, read_answer, turn_away,
+        BUSY_ANSWER, CHUNK_SILENCE, DaemonError, MAX_PENDING, PROTOCOL_VERSION, QUERY_TIMEOUT,
+        RESYNC_EVERY, STALE_FOR, Shared, SharedState, StateDto, Tracker, answer_err, apply, bind,
+        check_version, connect, exchange, lock, parse_answer, read_answer, turn_away,
     };
     use rcp2_proto::{Change, Node, Var};
     use std::io::Write as _;
@@ -694,6 +765,7 @@ mod tests {
             connected: true,
             tree: Some(Node::default()),
             refreshing_since: Some(asked),
+            starting_since: None,
             notifications: 0,
         };
         let soon = StateDto::new(&shared, asked + Duration::from_secs(1));
@@ -831,5 +903,287 @@ mod tests {
         // Left behind by a killed service: nobody listens on it.
         drop(listener);
         assert!(matches!(connect(&path), Err(DaemonError::NotRunning)));
+    }
+
+    // Table S of `05-Etats-et-flux`: the service's rules, with the time given.
+
+    fn secs(value: f64) -> Duration {
+        Duration::from_secs_f64(value)
+    }
+
+    fn just_before(limit: Duration) -> Duration {
+        limit.saturating_sub(secs(0.1))
+    }
+
+    /// A tree whose dump takes several reports, with one channel-like child.
+    fn board_tree() -> Node {
+        Node {
+            name: "ROOT".to_owned(),
+            properties: vec![("blob".to_owned(), Var::String("x".repeat(600)))],
+            children: vec![Node {
+                name: "CHANNEL".to_owned(),
+                properties: vec![("level".to_owned(), Var::Int(1))],
+                children: vec![],
+            }],
+        }
+    }
+
+    /// The reports of a dump, as the board sends them.
+    fn dump_reports(root: &Node) -> Vec<Vec<u8>> {
+        let mut message = vec![2];
+        message.extend(rcp2_proto::encode_tree(root));
+        let mut stream = u32::try_from(message.len()).unwrap().to_le_bytes().to_vec();
+        stream.extend(message);
+        stream
+            .chunks(255)
+            .map(|chunk| {
+                let mut report = vec![rcp2_proto::PROPERTY_IN_REPORT_ID];
+                report.extend_from_slice(chunk);
+                report.resize(256, 0);
+                report
+            })
+            .collect()
+    }
+
+    fn level(value: i32) -> Change {
+        Change::PropertyChanged {
+            path: vec![0],
+            name: "level".to_owned(),
+            value: Var::Int(value),
+        }
+    }
+
+    fn served_level(shared: &SharedState) -> Option<Var> {
+        let state = lock(shared);
+        let tree = state.tree.as_ref()?;
+        tree.children
+            .first()?
+            .properties
+            .iter()
+            .find(|(name, _)| name == "level")
+            .map(|(_, value)| value.clone())
+    }
+
+    fn refreshing(shared: &SharedState, now: Instant) -> bool {
+        StateDto::new(&lock(shared), now).refreshing
+    }
+
+    /// A session whose first dump was asked for at `t0` and is fully in at
+    /// `t0` + 1 s.
+    fn synced(t0: Instant) -> (Tracker, SharedState) {
+        let shared = SharedState::new(std::sync::Mutex::new(Shared {
+            connected: true,
+            starting_since: Some(t0),
+            ..Shared::default()
+        }));
+        let mut sync = Tracker::default();
+        sync.start_request(&shared, t0);
+        for report in dump_reports(&board_tree()) {
+            sync.handle(&report, &shared, t0 + secs(1.0));
+        }
+        (sync, shared)
+    }
+
+    #[test]
+    fn s2_s3_the_first_dump_ends_starting_and_is_served() {
+        let t0 = Instant::now();
+        let shared = SharedState::new(std::sync::Mutex::new(Shared {
+            connected: true,
+            starting_since: Some(t0),
+            ..Shared::default()
+        }));
+        let mut sync = Tracker::default();
+        sync.start_request(&shared, t0);
+        let reading = StateDto::new(&lock(&shared), t0);
+        assert!(reading.starting && !reading.state_known);
+        for report in dump_reports(&board_tree()) {
+            sync.handle(&report, &shared, t0 + secs(0.5));
+        }
+        let read = StateDto::new(&lock(&shared), t0 + secs(0.5));
+        assert!(read.state_known && !read.refreshing && !read.starting);
+        assert!(!sync.due(t0 + secs(30.0)));
+    }
+
+    #[test]
+    fn s4_a_change_that_fits_is_applied() {
+        let t0 = Instant::now();
+        let (mut sync, shared) = synced(t0);
+        sync.change(level(7), &shared, t0 + secs(2.0));
+        assert_eq!(served_level(&shared), Some(Var::Int(7)));
+        assert!(!refreshing(&shared, t0 + secs(2.0)));
+        assert!(!sync.due(t0 + secs(30.0)));
+    }
+
+    #[test]
+    fn s5_a_change_that_does_not_fit_makes_the_shape_unsure() {
+        let t0 = Instant::now();
+        let unfit = [
+            Change::Structural {
+                kind: 3,
+                path: vec![],
+            },
+            Change::PropertyChanged {
+                path: vec![5],
+                name: "level".to_owned(),
+                value: Var::Int(3),
+            },
+        ];
+        for change in unfit {
+            let (mut sync, shared) = synced(t0);
+            sync.change(change, &shared, t0 + secs(6.0));
+            assert!(refreshing(&shared, t0 + secs(6.0)));
+            // Nothing more is applied to a tree of unsure shape.
+            sync.change(level(9), &shared, t0 + secs(6.0));
+            assert_eq!(served_level(&shared), Some(Var::Int(1)));
+            assert!(sync.due(t0 + secs(6.0)));
+        }
+        // A chunk that belongs to no dump.
+        let (mut sync, shared) = synced(t0);
+        let mut stray = vec![rcp2_proto::PROPERTY_IN_REPORT_ID];
+        stray.extend([0xFF; 255]);
+        sync.handle(&stray, &shared, t0 + secs(6.0));
+        assert!(refreshing(&shared, t0 + secs(6.0)));
+        assert!(sync.due(t0 + secs(6.0)));
+    }
+
+    #[test]
+    fn s6_a_request_held_by_the_rate_limit_is_kept() {
+        let t0 = Instant::now();
+        let (mut sync, shared) = synced(t0);
+        let unfit = Change::Structural {
+            kind: 3,
+            path: vec![],
+        };
+        sync.change(unfit, &shared, t0 + secs(2.0));
+        assert!(!sync.due(t0 + secs(2.0)));
+        assert!(!sync.due(t0 + just_before(RESYNC_EVERY)));
+        // Not forgotten: asked for once the limit allows.
+        assert!(sync.due(t0 + RESYNC_EVERY));
+    }
+
+    #[test]
+    fn s7_never_asked_again_while_chunks_arrive() {
+        let t0 = Instant::now();
+        let shared = SharedState::default();
+        let mut sync = Tracker::default();
+        sync.start_request(&shared, t0);
+        let reports = dump_reports(&board_tree());
+        assert!(reports.len() >= 3);
+        // Slow but steady: each chunk well within the silence limit, the
+        // whole dump past the rate limit.
+        let step = CHUNK_SILENCE.mul_f64(0.9);
+        let mut now = t0;
+        for (position, report) in reports.iter().enumerate() {
+            now += step;
+            if position == 1 {
+                // Changes lost mid-transfer: another dump is needed, but
+                // only once this one is in.
+                for value in 0..=i32::try_from(MAX_PENDING).unwrap() {
+                    sync.change(level(value), &shared, now);
+                }
+            }
+            assert!(!sync.due(now), "asked again mid-transfer");
+            sync.handle(report, &shared, now);
+        }
+        assert!(now > t0 + RESYNC_EVERY);
+        assert!(StateDto::new(&lock(&shared), now).state_known);
+        assert!(sync.due(now));
+    }
+
+    #[test]
+    fn s8_a_silent_dump_is_asked_again() {
+        let t0 = Instant::now();
+        let shared = SharedState::default();
+        let mut sync = Tracker::default();
+        sync.start_request(&shared, t0);
+        // Nothing at all: asked again, within the rate limit.
+        assert!(!sync.due(t0 + just_before(CHUNK_SILENCE)));
+        assert!(!sync.due(t0 + just_before(RESYNC_EVERY)));
+        assert!(sync.due(t0 + RESYNC_EVERY));
+        // Chunks that stop.
+        let reports = dump_reports(&board_tree());
+        let first = reports.first().unwrap();
+        let last_chunk = t0 + secs(4.5);
+        sync.handle(first, &shared, last_chunk);
+        assert!(!sync.due(last_chunk + just_before(CHUNK_SILENCE)));
+        assert!(sync.due(last_chunk + CHUNK_SILENCE));
+    }
+
+    #[test]
+    fn s9_changes_during_a_dump_go_to_the_new_tree() {
+        let t0 = Instant::now();
+        let (mut sync, shared) = synced(t0);
+        sync.start_request(&shared, t0 + secs(10.0));
+        sync.change(level(4), &shared, t0 + secs(10.0));
+        // Not applied to the tree being replaced.
+        assert_eq!(served_level(&shared), Some(Var::Int(1)));
+        for report in dump_reports(&board_tree()) {
+            sync.handle(&report, &shared, t0 + secs(11.0));
+        }
+        assert_eq!(served_level(&shared), Some(Var::Int(4)));
+        assert!(!refreshing(&shared, t0 + secs(11.0)));
+        // One that does not fit the new tree: S5 on it.
+        sync.start_request(&shared, t0 + secs(20.0));
+        let unfit = Change::Structural {
+            kind: 4,
+            path: vec![],
+        };
+        sync.change(unfit, &shared, t0 + secs(20.0));
+        sync.change(level(8), &shared, t0 + secs(20.0));
+        for report in dump_reports(&board_tree()) {
+            sync.handle(&report, &shared, t0 + secs(21.0));
+        }
+        assert!(refreshing(&shared, t0 + secs(21.0)));
+        // Past the one that did not fit, the shape is unsure: none applied.
+        assert_eq!(served_level(&shared), Some(Var::Int(1)));
+        assert!(sync.due(t0 + secs(25.0)));
+    }
+
+    #[test]
+    fn s5_s9_changes_lost_while_a_dump_arrives_need_another() {
+        let t0 = Instant::now();
+        let (mut sync, shared) = synced(t0);
+        sync.start_request(&shared, t0 + secs(10.0));
+        for value in 0..=i32::try_from(MAX_PENDING).unwrap() {
+            sync.change(level(value), &shared, t0 + secs(10.0));
+        }
+        for report in dump_reports(&board_tree()) {
+            sync.handle(&report, &shared, t0 + secs(11.0));
+        }
+        assert!(refreshing(&shared, t0 + secs(11.0)));
+        assert!(sync.due(t0 + secs(15.0)));
+    }
+
+    #[test]
+    fn s10_s11_starting_and_refreshing_are_bounded() {
+        let t0 = Instant::now();
+        let shared = Shared {
+            starting_since: Some(t0),
+            ..Shared::default()
+        };
+        assert!(StateDto::new(&shared, t0 + secs(1.0)).starting);
+        assert!(!StateDto::new(&shared, t0 + STALE_FOR).starting);
+        // A session ended: the service starts again from a blank state.
+        let ended = StateDto::new(&Shared::default(), t0);
+        assert!(!ended.connected && !ended.starting && !ended.state_known);
+    }
+
+    #[test]
+    fn s12_a_second_instance_refuses_to_start() {
+        let scratch = Scratch::new("bind");
+        let path = scratch.0.join("board.sock");
+        let first = bind(&path).unwrap();
+        assert!(matches!(bind(&path), Err(DaemonError::AlreadyRunning(_))));
+        // The first one is untouched.
+        assert!(connect(&path).is_ok());
+        // Killed: its socket stays, its lock goes; the next one starts.
+        drop(first);
+        assert!(path.exists());
+        let _again = bind(&path).unwrap();
+        // A file that is not a socket is not ours to remove.
+        let other = scratch.0.join("other").join("board.sock");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, "x").unwrap();
+        assert!(matches!(bind(&other), Err(DaemonError::AlreadyRunning(_))));
     }
 }
