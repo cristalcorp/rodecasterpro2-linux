@@ -1,12 +1,11 @@
 //! TUI state and key handling: pure, no I/O, so it is tested without a terminal.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use rcp2_audio::{Channel, Graph};
 
-use crate::daemon::{CLIENT_TIMEOUT, StateDto};
-use crate::{BOARD_BEING_READ, BOARD_NOT_CONNECTED};
+use super::board::Console;
 
 /// Which panel receives the arrow keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,46 +48,8 @@ pub(crate) struct App {
     pub(crate) output_selected: usize,
     pub(crate) message: Option<(Level, String)>,
     pub(crate) show_help: bool,
-    /// What the Console panel shows.
-    pub(crate) board: BoardShown,
-    /// When the board service last answered, for the grace given to a
-    /// failed poll.
-    last_answer: Option<Instant>,
-}
-
-/// How long a poll without an answer in time still shows the last state: a
-/// busy service is not worth a flicker, a lasting failure is worth saying.
-/// A poll that times out ends `REFRESH_EVERY + CLIENT_TIMEOUT` after the
-/// last answer; one more timeout is the margin.
-pub(crate) const FAILURE_GRACE: Duration = super::REFRESH_EVERY
-    .saturating_add(CLIENT_TIMEOUT)
-    .saturating_add(CLIENT_TIMEOUT);
-
-/// Why the board service could not be asked.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BoardIssue {
-    /// No board service answers.
-    NotRunning,
-    /// The service did not answer in time (busy, or stuck).
-    Timeout,
-    /// Anything else (another protocol version included), with the reason
-    /// to show.
-    Other(String),
-}
-
-/// What the board service said: its state, or why it could not be asked.
-pub(crate) type BoardView = Result<StateDto, BoardIssue>;
-
-/// What the Console panel shows, decided when an answer arrives.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BoardShown {
-    /// The board's state as the service sent it; `unanswered` when the
-    /// service has not answered the latest polls in time.
-    State {
-        state: StateDto,
-        unanswered: bool,
-    },
-    Message(String),
+    /// The board service's answers and what the Console panel shows.
+    pub(crate) console: Console,
 }
 
 impl App {
@@ -100,47 +61,8 @@ impl App {
             output_selected: 0,
             message: None,
             show_help: false,
-            board: BoardShown::Message("Asking the board service…".to_owned()),
-            last_answer: None,
+            console: Console::new(Instant::now()),
         }
-    }
-
-    /// Records the board service's answer at `now`. A poll without an
-    /// answer in time keeps the last state for a moment, marked refreshing.
-    pub(crate) fn set_board(&mut self, view: BoardView, now: Instant) {
-        self.board = match view {
-            Ok(state) => {
-                self.last_answer = Some(now);
-                if !state.connected {
-                    BoardShown::Message(BOARD_NOT_CONNECTED.to_owned())
-                } else if !state.state_known {
-                    BoardShown::Message(BOARD_BEING_READ.to_owned())
-                } else {
-                    BoardShown::State {
-                        state,
-                        unanswered: false,
-                    }
-                }
-            }
-            Err(BoardIssue::Timeout) => {
-                let recent = self
-                    .last_answer
-                    .is_some_and(|last| now.saturating_duration_since(last) < FAILURE_GRACE);
-                match &mut self.board {
-                    BoardShown::State { unanswered, .. } if recent => {
-                        *unanswered = true;
-                        return;
-                    }
-                    _ => BoardShown::Message("Board service: no answer in time".to_owned()),
-                }
-            }
-            Err(BoardIssue::Other(reason)) => {
-                BoardShown::Message(format!("Board service: {reason}"))
-            }
-            Err(BoardIssue::NotRunning) => BoardShown::Message(
-                "Board service not running: `rcp2ctl hid setup` installs it.".to_owned(),
-            ),
-        };
     }
 
     /// Replaces the graph, keeping the selection on the same stream when it

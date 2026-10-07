@@ -28,7 +28,7 @@ const RECONNECT_EVERY: Duration = Duration::from_secs(2);
 /// Largest request accepted from a client.
 const MAX_REQUEST: u64 = 256;
 /// How long a client may take to send its request.
-pub(crate) const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Version of the socket protocol.
 /// 2: channels carry their source code, fader levels may be unreadable.
 /// 3: the previous state is kept, marked refreshing, while a new dump is read.
@@ -43,6 +43,13 @@ const RESYNC_EVERY: Duration = Duration::from_secs(5);
 const MAX_PENDING: usize = 1024;
 /// Clients served at the same time.
 const MAX_CLIENTS: usize = 8;
+/// How long a client's whole request may take, from sending it to the end
+/// of the answer.
+pub(crate) const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Largest answer a client accepts.
+const MAX_ANSWER: usize = 1 << 20;
+/// The line sent to a client turned away because enough are being served.
+const BUSY_ANSWER: &str = "{\"error\":\"busy\"}";
 /// Pause after a failed `accept`, so a persistent error cannot spin.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(200);
 
@@ -60,11 +67,22 @@ pub(crate) enum DaemonError {
     #[error("the board service sent an invalid answer: {0}")]
     BadAnswer(String),
     #[error(
-        "the board service is older than this rcp2ctl: restart it with this one (`hid setup` does it for the systemd service)"
+        "the board service is older than this rcp2ctl: restart it with this one (`rcp2ctl hid setup` for the systemd service)"
     )]
     ServiceOlder,
     #[error("the board service is newer than this rcp2ctl: use the rcp2ctl it was installed with")]
     ServiceNewer,
+    #[error("the board service is busy")]
+    Busy,
+    #[error("the board service did not answer in time")]
+    NoAnswer,
+}
+
+impl DaemonError {
+    /// Worth asking again: the service is there but could not answer now.
+    pub(crate) const fn is_transient(&self) -> bool {
+        matches!(self, Self::Busy | Self::NoAnswer)
+    }
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> DaemonError + use<> {
@@ -377,6 +395,12 @@ fn serve(listener: &UnixListener, shared: &SharedState) {
         };
         if active.fetch_add(1, Ordering::SeqCst) >= MAX_CLIENTS {
             active.fetch_sub(1, Ordering::SeqCst);
+            // Said rather than hung up on, so the client knows to ask again;
+            // a fresh socket takes one short line without blocking.
+            let mut stream = stream;
+            let _ = stream
+                .set_nonblocking(true)
+                .and_then(|()| writeln!(stream, "{BUSY_ANSWER}"));
             continue;
         }
         let shared = Arc::clone(shared);
@@ -417,21 +441,59 @@ fn check_version(version: u32) -> Result<(), DaemonError> {
 /// # Errors
 ///
 /// Returns [`DaemonError::NotRunning`] if no service answers,
-/// [`DaemonError::BadAnswer`] if the answer cannot be read, and
-/// [`DaemonError::ServiceOlder`] or [`DaemonError::ServiceNewer`] if the
-/// service speaks another protocol version.
+/// [`DaemonError::Busy`] or [`DaemonError::NoAnswer`] if it cannot answer
+/// now (within [`QUERY_TIMEOUT`]), [`DaemonError::BadAnswer`] if the answer
+/// cannot be read, and [`DaemonError::ServiceOlder`] or
+/// [`DaemonError::ServiceNewer`] if it speaks another protocol version.
 pub(crate) fn query_state() -> Result<StateDto, DaemonError> {
     let path = socket_path()?;
     let mut stream = UnixStream::connect(&path).map_err(|_| DaemonError::NotRunning)?;
+    let deadline = Instant::now() + QUERY_TIMEOUT;
     stream
-        .set_read_timeout(Some(CLIENT_TIMEOUT))
+        .set_write_timeout(Some(QUERY_TIMEOUT))
         .map_err(io_err(&path))?;
-    writeln!(stream, "state").map_err(io_err(&path))?;
-    let mut line = String::new();
-    BufReader::new(stream.take(1 << 20))
-        .read_line(&mut line)
-        .map_err(io_err(&path))?;
+    writeln!(stream, "state").map_err(|err| answer_err(&path, err))?;
+    let line = read_answer(&mut stream, deadline).map_err(|err| answer_err(&path, err))?;
     parse_answer(&line)
+}
+
+/// A failed exchange: a timeout or a dropped connection means the service
+/// could not answer now; anything else is reported as is.
+fn answer_err(path: &Path, err: io::Error) -> DaemonError {
+    match err.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => DaemonError::NoAnswer,
+        io::ErrorKind::ConnectionReset
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof => DaemonError::Busy,
+        _ => io_err(path)(err),
+    }
+}
+
+/// Reads one answer line, all of it by `deadline` (a per-read timeout
+/// alone lets a service that trickles bytes take forever).
+fn read_answer(stream: &mut UnixStream, deadline: Instant) -> io::Result<String> {
+    let mut answer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while !answer.contains(&b'\n') {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        stream.set_read_timeout(Some(left))?;
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => answer.extend_from_slice(chunk.get(..read).unwrap_or_default()),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+        if answer.len() > MAX_ANSWER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "answer too long",
+            ));
+        }
+    }
+    String::from_utf8(answer).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8"))
 }
 
 /// Reads the version alone first: another version may have another shape.
@@ -439,6 +501,17 @@ fn parse_answer(line: &str) -> Result<StateDto, DaemonError> {
     #[derive(Deserialize)]
     struct Versioned {
         version: u32,
+    }
+    #[derive(Deserialize)]
+    struct Refused {
+        error: String,
+    }
+    if let Ok(Refused { error }) = serde_json::from_str(line) {
+        return Err(if error == "busy" {
+            DaemonError::Busy
+        } else {
+            DaemonError::BadAnswer(error)
+        });
     }
     let bad = |err: serde_json::Error| DaemonError::BadAnswer(err.to_string());
     check_version(
@@ -452,10 +525,13 @@ fn parse_answer(line: &str) -> Result<StateDto, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonError, PROTOCOL_VERSION, STALE_FOR, Shared, StateDto, apply, check_version,
-        parse_answer,
+        BUSY_ANSWER, DaemonError, PROTOCOL_VERSION, STALE_FOR, Shared, StateDto, answer_err, apply,
+        check_version, parse_answer, read_answer,
     };
     use rcp2_proto::{Change, Node, Var};
+    use std::io::Write as _;
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -550,5 +626,49 @@ mod tests {
         );
         assert!(done.state_known);
         assert!(!done.refreshing);
+    }
+
+    #[test]
+    fn a_turned_away_client_is_told_to_ask_again() {
+        assert!(matches!(parse_answer(BUSY_ANSWER), Err(DaemonError::Busy)));
+        assert!(matches!(
+            parse_answer("{\"error\":\"unknown request\"}"),
+            Err(DaemonError::BadAnswer(_))
+        ));
+        assert!(DaemonError::Busy.is_transient());
+        assert!(DaemonError::NoAnswer.is_transient());
+        assert!(!DaemonError::ServiceOlder.is_transient());
+    }
+
+    /// Reads from one end of a socket pair, the other end fed by `feed`.
+    fn read_from(feed: impl FnOnce(UnixStream), within: Duration) -> Result<String, DaemonError> {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        feed(theirs);
+        read_answer(&mut ours, Instant::now() + within)
+            .map_err(|err| answer_err(Path::new("test.sock"), err))
+    }
+
+    #[test]
+    fn the_whole_answer_must_come_in_time() {
+        let started = Instant::now();
+        // Part of a line, then nothing: the deadline ends the wait.
+        let kept_open = std::sync::Mutex::new(None);
+        let slow = read_from(
+            |mut theirs| {
+                theirs.write_all(b"{\"version\"").unwrap();
+                *kept_open.lock().unwrap() = Some(theirs);
+            },
+            Duration::from_millis(200),
+        );
+        assert!(matches!(slow, Err(DaemonError::NoAnswer)), "{slow:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Hung up without a word: the service could not answer now.
+        let dropped = read_from(drop, Duration::from_secs(1));
+        assert!(matches!(dropped, Err(DaemonError::Busy)), "{dropped:?}");
+        let whole = read_from(
+            |mut theirs| theirs.write_all(b"{}\n").unwrap(),
+            Duration::from_secs(1),
+        );
+        assert_eq!(whole.unwrap(), "{}\n");
     }
 }
