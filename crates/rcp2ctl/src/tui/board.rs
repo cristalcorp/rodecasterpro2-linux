@@ -1,26 +1,29 @@
 //! What the Console panel shows: decided from the board service's answers,
 //! pure, so it is tested without a service or a terminal.
 
+use std::time::Duration;
+
 use rcp2_audio::Channel;
 use rcp2_proto::InputSource;
-
-use std::time::Duration;
 
 use crate::daemon::{DaemonError, StateDto};
 use crate::service::RESTART_AFTER;
 use crate::{BOARD_BEING_READ, BOARD_NOT_CONNECTED};
 
-/// How long a restarted service may take to listen again.
-const START_MARGIN: Duration = Duration::from_secs(2);
+/// How long a restarted service may take to listen, find the board and read
+/// its state (a dump of about 139 KB; the total is not measured, a margin).
+const START_MARGIN: Duration = Duration::from_secs(3);
 /// Polls in a row that may fail for a passing reason while the last answer
 /// is still shown: enough for a crashed service to be restarted (polls are
 /// at least `REFRESH_EVERY` apart, plus the one that saw it go). Counted
 /// rather than timed, so late polls cannot shorten it.
-const PASSING_POLLS: u64 =
-    1 + RESTART_AFTER.saturating_add(START_MARGIN).as_secs() / super::REFRESH_EVERY.as_secs();
+const PASSING_POLLS: u128 = 1 + RESTART_AFTER
+    .saturating_add(START_MARGIN)
+    .as_millis()
+    .div_ceil(super::REFRESH_EVERY.as_millis());
 /// Of those, polls that ran out of time: each lasts up to `QUERY_TIMEOUT`,
 /// so a frozen service is said after two.
-const TIMED_OUT_POLLS: u64 = 2;
+const TIMED_OUT_POLLS: u128 = 2;
 
 const NO_CHANNEL: &str = "No channel is assigned on the board.";
 const ASKING: &str = "Asking the board service…";
@@ -130,9 +133,9 @@ pub(crate) struct Console {
     /// a failure is said, so a later passing one cannot bring it back.
     last: Option<StateDto>,
     /// Polls failed in a row since the last answer.
-    failed: u64,
+    failed: u128,
     /// Of those, polls that ran out of time.
-    timed_out: u64,
+    timed_out: u128,
     shown: BoardShown,
 }
 
@@ -155,7 +158,13 @@ impl Console {
     /// [`TIMED_OUT_POLLS`] timeouts), marked refreshing; anything else is said
     /// at once.
     pub(crate) fn record(&mut self, view: BoardView) {
-        let issue = match view {
+        let waiting = self.failed > 0 && self.last.is_some();
+        let (said, patience) = match view {
+            // A restarted service that has not read the board yet: still
+            // part of the wait. Outside one (an unplug), said at once.
+            Ok(state) if waiting && !(state.connected && state.state_known) => {
+                (from_state(&state, false), Patience::Passing)
+            }
             Ok(state) => {
                 self.shown = from_state(&state, false);
                 self.last = Some(state);
@@ -163,20 +172,20 @@ impl Console {
                 self.timed_out = 0;
                 return;
             }
-            Err(issue) => issue,
+            Err(issue) => (BoardShown::Message(issue.text), issue.patience),
         };
         self.failed = self.failed.saturating_add(1);
-        if issue.patience == Patience::TimedOut {
+        if patience == Patience::TimedOut {
             self.timed_out = self.timed_out.saturating_add(1);
         }
-        let passing = issue.patience != Patience::None
+        let passing = patience != Patience::None
             && self.failed <= PASSING_POLLS
             && self.timed_out <= TIMED_OUT_POLLS;
         self.shown = match &self.last {
             Some(state) if passing => from_state(state, true),
             _ => {
                 self.last = None;
-                BoardShown::Message(issue.text)
+                said
             }
         };
     }
@@ -336,18 +345,37 @@ pub(crate) mod tests {
             let mut console = Console::new();
             console.record(Ok(board_state(true)));
             console.record(failed(&first));
-            for _ in 1..PASSING_POLLS {
-                console.record(failed(&DaemonError::NotRunning));
-                assert_eq!(refreshing(&console), Some(true), "{first}");
-            }
+            assert_eq!(refreshing(&console), Some(true), "{first}");
+            console.record(failed(&DaemonError::NotRunning));
+            // Back, the board not read yet: still waited out.
+            let mut found = board_state(false);
+            found.connected = false;
+            console.record(Ok(found));
+            console.record(Ok(board_state(false)));
+            assert_eq!(refreshing(&console), Some(true), "{first}");
             console.record(Ok(board_state(true)));
             assert_eq!(refreshing(&console), Some(false));
-            // Still absent after a restart's time: said.
-            for _ in 0..=PASSING_POLLS {
-                console.record(failed(&DaemonError::NotRunning));
-            }
-            assert!(text(&console).starts_with("The board service is not running"));
         }
+    }
+
+    #[test]
+    fn passing_failures_are_said_past_the_limit() {
+        let mut console = Console::new();
+        console.record(Ok(board_state(true)));
+        for _ in 0..PASSING_POLLS {
+            console.record(failed(&DaemonError::Busy));
+            assert_eq!(refreshing(&console), Some(true));
+        }
+        console.record(failed(&DaemonError::Busy));
+        assert_eq!(text(&console), "The board service is busy.");
+        // A restart that never reads the board: said once the wait is over.
+        let mut console = Console::new();
+        console.record(Ok(board_state(true)));
+        console.record(failed(&DaemonError::NotRunning));
+        for _ in 1..=PASSING_POLLS {
+            console.record(Ok(board_state(false)));
+        }
+        assert_eq!(text(&console), crate::BOARD_BEING_READ);
     }
 
     #[test]

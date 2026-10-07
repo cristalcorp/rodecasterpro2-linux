@@ -248,8 +248,12 @@ fn bind(path: &Path) -> Result<UnixListener, DaemonError> {
             // Could not tell (out of files, path too long…): said, not guessed.
             Err(err) => return Err(io_err(path)(err)),
         }
-        // A socket nobody listens on: left over by a killed instance.
-        fs::remove_file(path).map_err(io_err(path))?;
+        // A socket nobody listens on: left over by a killed instance (or
+        // already gone).
+        match fs::remove_file(path) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(io_err(path)(err)),
+            _ => {}
+        }
     }
     let listener = UnixListener::bind(path).map_err(io_err(path))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(io_err(path))?;
@@ -607,8 +611,8 @@ fn parse_answer(line: &str) -> Result<StateDto, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BUSY_ANSWER, DaemonError, PROTOCOL_VERSION, STALE_FOR, Shared, StateDto, answer_err, apply,
-        check_version, connect, exchange, parse_answer, read_answer, turn_away,
+        BUSY_ANSWER, DaemonError, PROTOCOL_VERSION, QUERY_TIMEOUT, STALE_FOR, Shared, StateDto,
+        answer_err, apply, check_version, connect, exchange, parse_answer, read_answer, turn_away,
     };
     use rcp2_proto::{Change, Node, Var};
     use std::io::Write as _;
@@ -821,7 +825,8 @@ mod tests {
             assert!(held.len() < 16, "the backlog never filled");
         };
         assert!(matches!(full, DaemonError::NoAnswer), "{full:?}");
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Never the wait of a blocking connect.
+        assert!(started.elapsed() < QUERY_TIMEOUT);
         // Left behind by a killed service: nobody listens on it.
         drop(listener);
         assert!(matches!(connect(&path), Err(DaemonError::NotRunning)));

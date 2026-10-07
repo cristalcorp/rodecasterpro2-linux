@@ -32,7 +32,7 @@ pub(crate) fn unit_text(exe: &Path) -> String {
          [Service]\n\
          ExecStart=\"{}\" daemon\n\
          Restart=on-failure\n\
-         RestartSec={restart}\n\
+         RestartSec={restart}ms\n\
          # Least privilege: it reads a device file, serves a local socket and talks\n\
          # to PipeWire through its local sockets (pactl, pw-dump).\n\
          NoNewPrivileges=yes\n\
@@ -52,7 +52,7 @@ pub(crate) fn unit_text(exe: &Path) -> String {
          [Install]\n\
          WantedBy=default.target\n",
         exe.display(),
-        restart = RESTART_AFTER.as_secs(),
+        restart = RESTART_AFTER.as_millis(),
     )
 }
 
