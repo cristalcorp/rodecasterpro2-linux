@@ -547,6 +547,9 @@ fn answer(stream: UnixStream, shared: &SharedState) -> io::Result<()> {
     if request.trim() != "state" {
         return writeln!(stream, "{{\"error\":\"unknown request\"}}");
     }
+    // Built under the lock, so every field is of the same moment: it reads
+    // a few nodes, cheaper than copying the tree out. The lock is released
+    // before the answer is serialized and written.
     let answer = StateDto::new(&lock(shared), Instant::now());
     let json = serde_json::to_string(&answer).map_err(io::Error::other)?;
     writeln!(stream, "{json}")

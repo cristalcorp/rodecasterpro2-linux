@@ -29,24 +29,37 @@ pub enum InputSource {
 }
 
 impl InputSource {
+    /// The named sources; their codes are written once, in [`Self::code`].
+    const NAMED: [Self; 7] = [
+        Self::Mic1,
+        Self::Usb1,
+        Self::Chat,
+        Self::SmartPads,
+        Self::Game,
+        Self::Music,
+        Self::Empty,
+    ];
+
     /// Interprets a `channelInputSource` value.
     #[must_use]
     pub const fn from_code(code: i32) -> Self {
-        match code {
-            0 => Self::Mic1,
-            7 => Self::Usb1,
-            8 => Self::Chat,
-            11 => Self::SmartPads,
-            12 => Self::Game,
-            13 => Self::Music,
-            -1 => Self::Empty,
-            other => Self::Code(other),
+        let mut position = 0;
+        while position < Self::NAMED.len() {
+            let named = Self::NAMED[position];
+            if let Some(named_code) = named.code()
+                && named_code == code
+            {
+                return named;
+            }
+            position += 1;
         }
+        Self::Code(code)
     }
 
     /// The `channelInputSource` code, `None` for [`InputSource::Unknown`].
     #[must_use]
     pub const fn code(self) -> Option<i32> {
+        // The one table of codes: a named source and its code.
         match self {
             Self::Mic1 => Some(0),
             Self::Usb1 => Some(7),
@@ -249,6 +262,37 @@ mod tests {
         assert_eq!(InputSource::Game.code(), Some(12));
         for code in [-1, 0, 7, 8, 9, 11, 12, 13] {
             assert_eq!(InputSource::from_code(code).code(), Some(code));
+        }
+    }
+
+    #[test]
+    fn every_named_source_is_read_back_from_its_code() {
+        let named = |source: InputSource| match source {
+            InputSource::Mic1
+            | InputSource::Usb1
+            | InputSource::Chat
+            | InputSource::SmartPads
+            | InputSource::Game
+            | InputSource::Music
+            | InputSource::Empty => true,
+            // Not named: a new variant must be sorted here, and listed in
+            // `NAMED` if it is.
+            InputSource::Unknown | InputSource::Code(_) => false,
+        };
+        assert!(InputSource::NAMED.into_iter().all(named));
+        for source in InputSource::NAMED {
+            let code = source.code().unwrap();
+            assert_eq!(InputSource::from_code(code), source);
+        }
+        assert_eq!(InputSource::from_code(9), InputSource::Code(9));
+        // No two named sources share a code.
+        for (position, source) in InputSource::NAMED.into_iter().enumerate() {
+            assert!(!InputSource::NAMED[position + 1..].contains(&source));
+            assert!(
+                InputSource::NAMED[position + 1..]
+                    .iter()
+                    .all(|other| other.code() != source.code())
+            );
         }
     }
 
