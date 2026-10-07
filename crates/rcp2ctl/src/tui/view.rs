@@ -11,7 +11,7 @@ use rcp2_audio::{Channel, PersistState};
 
 use super::app::{App, Focus, Level};
 use super::board::BoardShown;
-use crate::{channel_of, mute_label, output_label};
+use crate::{channel_of, level_percent, mute_label, output_label};
 
 /// Golden yellow accent.
 const ACCENT: Color = Color::Rgb(255, 191, 0);
@@ -255,11 +255,7 @@ fn render_console(frame: &mut Frame<'_>, board: &BoardShown, lines: Vec<String>,
             Some(false) => Style::new().fg(Color::Green),
             None => Style::new(),
         };
-        let level = match (strip.fader, strip.level) {
-            (Some(_), Some(level)) => fader_bar(level),
-            (Some(_), None) => "?".to_owned(),
-            (None, _) => String::new(),
-        };
+        let level = strip.level.map_or_else(|| "?".to_owned(), level_bar);
         Row::new(vec![
             Cell::from(
                 strip
@@ -271,7 +267,7 @@ fn render_console(frame: &mut Frame<'_>, board: &BoardShown, lines: Vec<String>,
             Cell::from(level),
         ])
     });
-    let header = Row::new(["FADER", "SOURCE", "OUTPUT", "LEVEL (last full read)"])
+    let header = Row::new(["FADER", "SOURCE", "OUTPUT", "LEVEL"])
         .style(Style::new().add_modifier(Modifier::BOLD));
     let table = Table::new(
         rows,
@@ -287,10 +283,15 @@ fn render_console(frame: &mut Frame<'_>, board: &BoardShown, lines: Vec<String>,
     frame.render_widget(table, area);
 }
 
-/// A 0–127 fader level as a 12-cell bar and its value.
-fn fader_bar(level: i32) -> String {
+/// A 0–127 level as a 12-cell bar and its percentage.
+fn level_bar(level: i32) -> String {
     let filled = usize::try_from(level.clamp(0, 127) * 12 / 127).unwrap_or(0);
-    format!("{}{} {level}", "█".repeat(filled), "·".repeat(12 - filled))
+    format!(
+        "{}{} {}%",
+        "█".repeat(filled),
+        "·".repeat(12 - filled),
+        level_percent(level)
+    )
 }
 
 fn render_apps(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -542,12 +543,15 @@ mod tests {
         assert!(screen.contains("F1"), "{screen}");
         assert!(screen.contains("Mic 1"), "{screen}");
         assert!(screen.contains("muted"), "{screen}");
-        assert!(screen.contains("████████████ 127"), "{screen}");
-        // Empty strips are hidden; an unreadable source is shown, with an
-        // unreadable level; a strip past the last fader has none.
+        // Levels as percentages (N1); 45 of 127 is 35%.
+        assert!(screen.contains("████████████ 100%"), "{screen}");
+        assert!(screen.contains("████········ 35%"), "{screen}");
+        // Empty strips are hidden (N3); an unreadable source is shown, with
+        // an unreadable level (N4); a strip past the last fader has a level.
         assert!(!screen.contains("(empty)"), "{screen}");
         assert!(screen.contains("F7     ?"), "{screen}");
         assert!(screen.contains("source 9"), "{screen}");
+        assert!(screen.contains("············ 0%"), "{screen}");
     }
 
     #[test]

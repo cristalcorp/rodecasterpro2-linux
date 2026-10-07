@@ -188,9 +188,9 @@ The screen has a header (board, how the outputs are kept, default output), an
 
 When the board service runs (`rcp2ctl hid setup`), a **Console** panel at the
 bottom shows the board's channel strips: fader, source, whether the output is
-muted (updated live) and the fader level. Fader levels are as of the last full
-read of the board: the board sends no update when a fader moves. Without the
-service, the panel says how to start it; everything else works the same.
+muted and its level as a percentage, both updated live as you press a mute
+button or move a fader. Without the service, the panel says how to start it;
+everything else works the same.
 
 | Key | Action |
 |---|---|
@@ -269,7 +269,7 @@ installing anything. Useful for packagers.
 ### `rcp2ctl board`
 
 Shows the board's own state — firmware version, each channel strip (source,
-muted or not), fader positions (0–127) and how many changes were applied since
+muted or not, level as a percentage) and how many changes were applied since
 the last full read — as kept up to date by the board service. Fails with a
 clear message if the service is not running.
 
@@ -368,8 +368,10 @@ tells you when the installed service was written by an older version.
 
 The board answers a session request with a dump of its whole state (about
 90 KB): channels and their sources, faders, mutes, processing, pads, system
-settings. The tool decodes it exactly (it is a JUCE `ValueTree`). Verified on
-firmware 1.6.8: fader positions and mute states match the board.
+settings. The tool decodes it exactly (it is a JUCE `ValueTree`). The board then
+reports each change as it happens, including fader moves (as the level of each
+source's mixes). Verified on firmware 1.7.6: levels and mute states follow the
+board.
 
 ### 10.4 What is never done
 
@@ -477,7 +479,7 @@ opens the TUI; in scripts, use the commands from the reference.
 | Reading the board's state | Done: exact decoder, board service, `rcp2ctl board` |
 | Fix for the fader freeze | Done while the board service runs |
 | Board state in the TUI | Done: Console panel, fader of each output |
-| Live fader levels in the TUI | Planned (faders send no live notification; MIDI is being evaluated) |
+| Live fader levels in the TUI | Done: each channel's level, updated as the fader moves |
 | Writing board settings (mutes, gain, processing) | Later, one setting type at a time, each tested on hardware first |
 
 ## 15. Development
