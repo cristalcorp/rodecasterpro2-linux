@@ -825,8 +825,9 @@ mod tests {
             assert!(held.len() < 16, "the backlog never filled");
         };
         assert!(matches!(full, DaemonError::NoAnswer), "{full:?}");
-        // Never the wait of a blocking connect.
-        assert!(started.elapsed() < QUERY_TIMEOUT);
+        // Never the wait of a blocking connect (a quarter of the timeout
+        // leaves room for a loaded test machine).
+        assert!(started.elapsed() < QUERY_TIMEOUT / 4);
         // Left behind by a killed service: nobody listens on it.
         drop(listener);
         assert!(matches!(connect(&path), Err(DaemonError::NotRunning)));

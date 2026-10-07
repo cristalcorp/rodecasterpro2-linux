@@ -33,8 +33,11 @@ const ASKING: &str = "Asking the board service…";
 pub(crate) enum Patience {
     /// Said at once.
     None,
-    /// Busy, hung up or absent: most often a moment of load or a restart.
+    /// Busy: a moment of load.
     Passing,
+    /// Hung up or absent: most often a restart, whose first answers (the
+    /// board not read yet) are waited out too.
+    Gone,
     /// No answer in time: a frozen service is said sooner.
     TimedOut,
 }
@@ -49,7 +52,8 @@ pub(crate) struct BoardIssue {
 impl From<&DaemonError> for BoardIssue {
     fn from(err: &DaemonError) -> Self {
         let patience = match err {
-            DaemonError::Busy | DaemonError::Dropped | DaemonError::NotRunning => Patience::Passing,
+            DaemonError::Busy => Patience::Passing,
+            DaemonError::Dropped | DaemonError::NotRunning => Patience::Gone,
             DaemonError::NoAnswer => Patience::TimedOut,
             _ => Patience::None,
         };
@@ -136,6 +140,8 @@ pub(crate) struct Console {
     failed: u128,
     /// Of those, polls that ran out of time.
     timed_out: u128,
+    /// One of those found the service gone: it may be restarting.
+    gone: bool,
     shown: BoardShown,
 }
 
@@ -145,6 +151,7 @@ impl Console {
             last: None,
             failed: 0,
             timed_out: 0,
+            gone: false,
             shown: BoardShown::Message(ASKING.to_owned()),
         }
     }
@@ -158,11 +165,12 @@ impl Console {
     /// [`TIMED_OUT_POLLS`] timeouts), marked refreshing; anything else is said
     /// at once.
     pub(crate) fn record(&mut self, view: BoardView) {
-        let waiting = self.failed > 0 && self.last.is_some();
+        // Restarting after showing a board that was read.
+        let restarting = self.gone && self.last.as_ref().is_some_and(read);
         let (said, patience) = match view {
             // A restarted service that has not read the board yet: still
-            // part of the wait. Outside one (an unplug), said at once.
-            Ok(state) if waiting && !(state.connected && state.state_known) => {
+            // part of the wait. Otherwise (an unplug), said at once.
+            Ok(state) if restarting && !read(&state) => {
                 (from_state(&state, false), Patience::Passing)
             }
             Ok(state) => {
@@ -170,13 +178,16 @@ impl Console {
                 self.last = Some(state);
                 self.failed = 0;
                 self.timed_out = 0;
+                self.gone = false;
                 return;
             }
             Err(issue) => (BoardShown::Message(issue.text), issue.patience),
         };
         self.failed = self.failed.saturating_add(1);
-        if patience == Patience::TimedOut {
-            self.timed_out = self.timed_out.saturating_add(1);
+        match patience {
+            Patience::TimedOut => self.timed_out = self.timed_out.saturating_add(1),
+            Patience::Gone => self.gone = true,
+            Patience::None | Patience::Passing => {}
         }
         let passing = patience != Patience::None
             && self.failed <= PASSING_POLLS
@@ -189,6 +200,11 @@ impl Console {
             }
         };
     }
+}
+
+/// The board's state is there to show.
+const fn read(state: &StateDto) -> bool {
+    state.connected && state.state_known
 }
 
 /// The panel for an answer; `unanswered` when later polls failed.
@@ -313,10 +329,10 @@ pub(crate) mod tests {
         );
         assert!(not_running.text.ends_with(')'));
         assert_eq!(older.patience, Patience::None);
-        assert_eq!(not_running.patience, Patience::Passing);
+        assert_eq!(not_running.patience, Patience::Gone);
         assert_eq!(issue(&DaemonError::Busy).patience, Patience::Passing);
         assert_eq!(issue(&DaemonError::NoAnswer).patience, Patience::TimedOut);
-        assert_eq!(issue(&DaemonError::Dropped).patience, Patience::Passing);
+        assert_eq!(issue(&DaemonError::Dropped).patience, Patience::Gone);
         assert_eq!(
             issue(&DaemonError::BadAnswer("x".to_owned())).text,
             "The board service sent an invalid answer: x."
@@ -359,6 +375,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_unplug_after_a_busy_poll_is_said_at_once() {
+        let mut console = Console::new();
+        console.record(Ok(board_state(true)));
+        // The service is there: busy or slow, not restarting.
+        for err in [DaemonError::Busy, DaemonError::NoAnswer] {
+            console.record(failed(&err));
+            let mut unplugged = board_state(false);
+            unplugged.connected = false;
+            console.record(Ok(unplugged));
+            assert_eq!(text(&console), crate::BOARD_NOT_CONNECTED, "{err}");
+            console.record(Ok(board_state(true)));
+        }
+        // Gone while the board was being read: its next state is said too.
+        console.record(Ok(board_state(false)));
+        console.record(failed(&DaemonError::NotRunning));
+        let mut unplugged = board_state(false);
+        unplugged.connected = false;
+        console.record(Ok(unplugged));
+        assert_eq!(text(&console), crate::BOARD_NOT_CONNECTED);
+    }
+
+    #[test]
     fn passing_failures_are_said_past_the_limit() {
         let mut console = Console::new();
         console.record(Ok(board_state(true)));
@@ -368,14 +406,28 @@ pub(crate) mod tests {
         }
         console.record(failed(&DaemonError::Busy));
         assert_eq!(text(&console), "The board service is busy.");
-        // A restart that never reads the board: said once the wait is over.
-        let mut console = Console::new();
-        console.record(Ok(board_state(true)));
-        console.record(failed(&DaemonError::NotRunning));
-        for _ in 1..=PASSING_POLLS {
-            console.record(Ok(board_state(false)));
+        // A restart that stays absent, or never reads the board: kept up to
+        // the limit, then said.
+        for back in [false, true] {
+            let mut console = Console::new();
+            console.record(Ok(board_state(true)));
+            console.record(failed(&DaemonError::Dropped));
+            for _ in 1..PASSING_POLLS {
+                if back {
+                    console.record(Ok(board_state(false)));
+                } else {
+                    console.record(failed(&DaemonError::NotRunning));
+                }
+                assert_eq!(refreshing(&console), Some(true), "back: {back}");
+            }
+            if back {
+                console.record(Ok(board_state(false)));
+                assert_eq!(text(&console), crate::BOARD_BEING_READ);
+            } else {
+                console.record(failed(&DaemonError::NotRunning));
+                assert!(text(&console).starts_with("The board service is not running"));
+            }
         }
-        assert_eq!(text(&console), crate::BOARD_BEING_READ);
     }
 
     #[test]
