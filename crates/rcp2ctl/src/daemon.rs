@@ -57,7 +57,7 @@ pub(crate) enum DaemonError {
     #[error("the board service sent an invalid answer: {0}")]
     BadAnswer(String),
     #[error(
-        "the board service is older than this rcp2ctl: run `hid setup` with this rcp2ctl to update it"
+        "the board service is older than this rcp2ctl: restart it with this one (`hid setup` does it for the systemd service)"
     )]
     ServiceOlder,
     #[error("the board service is newer than this rcp2ctl: use the rcp2ctl it was installed with")]
@@ -396,20 +396,6 @@ fn answer(stream: UnixStream, shared: &SharedState) -> io::Result<()> {
     writeln!(stream, "{json}")
 }
 
-/// Asks the running service for the board state.
-///
-/// # Errors
-///
-/// Returns [`DaemonError::NotRunning`] if no service answers,
-/// [`DaemonError::BadAnswer`] if the answer cannot be read, and
-/// [`DaemonError::ServiceOlder`] or [`DaemonError::ServiceNewer`] if the
-/// service speaks another protocol version.
-pub(crate) fn query_state() -> Result<StateDto, DaemonError> {
-    let state = query_any_version()?;
-    check_version(state.version)?;
-    Ok(state)
-}
-
 /// Accepts only the protocol version this build speaks.
 fn check_version(version: u32) -> Result<(), DaemonError> {
     match version.cmp(&PROTOCOL_VERSION) {
@@ -419,7 +405,15 @@ fn check_version(version: u32) -> Result<(), DaemonError> {
     }
 }
 
-fn query_any_version() -> Result<StateDto, DaemonError> {
+/// Asks the running service for the board state.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::NotRunning`] if no service answers,
+/// [`DaemonError::BadAnswer`] if the answer cannot be read, and
+/// [`DaemonError::ServiceOlder`] or [`DaemonError::ServiceNewer`] if the
+/// service speaks another protocol version.
+pub(crate) fn query_state() -> Result<StateDto, DaemonError> {
     let path = socket_path()?;
     let mut stream = UnixStream::connect(&path).map_err(|_| DaemonError::NotRunning)?;
     stream
@@ -430,12 +424,29 @@ fn query_any_version() -> Result<StateDto, DaemonError> {
     BufReader::new(stream.take(1 << 20))
         .read_line(&mut line)
         .map_err(io_err(&path))?;
-    serde_json::from_str(&line).map_err(|err| DaemonError::BadAnswer(err.to_string()))
+    parse_answer(&line)
+}
+
+/// Reads the version alone first: another version may have another shape.
+fn parse_answer(line: &str) -> Result<StateDto, DaemonError> {
+    #[derive(Deserialize)]
+    struct Versioned {
+        version: u32,
+    }
+    let bad = |err: serde_json::Error| DaemonError::BadAnswer(err.to_string());
+    check_version(
+        serde_json::from_str::<Versioned>(line)
+            .map_err(bad)?
+            .version,
+    )?;
+    serde_json::from_str(line).map_err(bad)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DaemonError, PROTOCOL_VERSION, Shared, StateDto, apply, check_version};
+    use super::{
+        DaemonError, PROTOCOL_VERSION, Shared, StateDto, apply, check_version, parse_answer,
+    };
     use rcp2_proto::{Change, Node, Var};
 
     #[test]
@@ -484,6 +495,22 @@ mod tests {
         assert!(matches!(
             check_version(PROTOCOL_VERSION + 1),
             Err(DaemonError::ServiceNewer)
+        ));
+    }
+
+    #[test]
+    fn a_newer_answer_of_another_shape_still_says_newer() {
+        let line = format!(
+            "{{\"version\":{},\"channels\":\"renamed\"}}",
+            PROTOCOL_VERSION + 1
+        );
+        assert!(matches!(
+            parse_answer(&line),
+            Err(DaemonError::ServiceNewer)
+        ));
+        assert!(matches!(
+            parse_answer("not json"),
+            Err(DaemonError::BadAnswer(_))
         ));
     }
 }

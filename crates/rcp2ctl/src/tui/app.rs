@@ -53,11 +53,17 @@ pub(crate) struct App {
     pub(crate) last_known: Option<StateDto>,
     /// Failed polls in a row since the last answer from the service.
     failed_polls: u8,
+    /// Polls in a row where the board was being read again.
+    reading_polls: u8,
 }
 
 /// Failed polls in a row (one a second) still shown as the last state:
 /// a busy service is not worth a flicker, a lasting failure is worth saying.
 const TOLERATED_FAILURES: u8 = 3;
+/// Polls in a row (one a second) the last state is shown while the board is
+/// read again: a dump takes a moment, but one that never comes must not
+/// leave old mutes and levels on screen.
+const TOLERATED_READING: u8 = 10;
 
 /// Why the board state is unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +91,7 @@ impl App {
             board: None,
             last_known: None,
             failed_polls: 0,
+            reading_polls: 0,
         }
     }
 
@@ -92,11 +99,16 @@ impl App {
     /// for as long as the same board session lasts, and through a few
     /// failed polls.
     pub(crate) fn set_board(&mut self, view: BoardView) {
-        if matches!(view, Err(BoardIssue::Other(_))) {
-            self.failed_polls = self.failed_polls.saturating_add(1);
-        } else {
-            self.failed_polls = 0;
-        }
+        let count =
+            |polls: &mut u8, now: bool| *polls = if now { polls.saturating_add(1) } else { 0 };
+        count(
+            &mut self.failed_polls,
+            matches!(view, Err(BoardIssue::Other(_))),
+        );
+        count(
+            &mut self.reading_polls,
+            matches!(&view, Ok(state) if state.connected && !state.state_known),
+        );
         match &view {
             Ok(state) if state.connected && state.state_known => {
                 self.last_known = Some(state.clone());
@@ -104,6 +116,7 @@ impl App {
             // Same session, being read again: the last state still holds.
             Ok(state)
                 if state.connected
+                    && self.reading_polls <= TOLERATED_READING
                     && self
                         .last_known
                         .as_ref()

@@ -30,7 +30,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
     // The console never takes the room of the body, the message or the keys,
     // and is left out when even its borders and one line do not fit.
     let room = frame.area().height.saturating_sub(1 + MIN_BODY + 1 + 1);
-    let console_height = if room < 3 {
+    let console_height = if room < board.min_height() {
         0
     } else {
         board.height().min(room)
@@ -200,12 +200,10 @@ impl<'a> BoardPanel<'a> {
             Some(Err(BoardIssue::NotRunning)) => Self::Message(
                 "Board service not running: `rcp2ctl hid setup` installs it.".to_owned(),
             ),
-            Some(Err(BoardIssue::Version(reason))) => {
-                Self::Message(format!("Board service: {reason}"))
-            }
+            Some(Err(BoardIssue::Version(reason))) => Self::Message(service_message(reason)),
             // A failed poll or two: `set_board` keeps the last state meanwhile.
             Some(Err(BoardIssue::Other(reason))) => app.last_known.as_ref().map_or_else(
-                || Self::Message(format!("Board service: {reason}")),
+                || Self::Message(service_message(reason)),
                 |last| shown(last, true),
             ),
             Some(Ok(state)) if state.connected && state.state_known => shown(state, false),
@@ -214,6 +212,15 @@ impl<'a> BoardPanel<'a> {
                 |last| shown(last, true),
             ),
             Some(Ok(_)) => Self::Message(BOARD_NOT_CONNECTED.to_owned()),
+        }
+    }
+
+    /// Fewest rows worth drawing: borders, and the header with one strip,
+    /// or the one line of a message.
+    fn min_height(&self) -> u16 {
+        match self {
+            Self::State { strips, .. } if !strips.is_empty() => 4,
+            _ => 3,
         }
     }
 
@@ -239,6 +246,14 @@ impl<'a> BoardPanel<'a> {
             Self::Message(_) => None,
         }
     }
+}
+
+/// A service error as a sentence about the service, said once.
+fn service_message(reason: &str) -> String {
+    reason.strip_prefix("the board service").map_or_else(
+        || format!("Board service: {reason}"),
+        |rest| format!("Board service{rest}"),
+    )
 }
 
 fn strips(state: &StateDto) -> Vec<Strip<'_>> {
@@ -665,7 +680,10 @@ mod tests {
         let reason = crate::daemon::DaemonError::ServiceOlder.to_string();
         app.set_board(Err(BoardIssue::Version(reason.clone())));
         let screen = screen(&app);
-        assert!(screen.contains("older than this rcp2ctl"), "{screen}");
+        assert!(
+            screen.contains("Board service is older than this rcp2ctl"),
+            "{screen}"
+        );
         assert!(!screen.contains("F5"), "{screen}");
     }
 
@@ -691,5 +709,28 @@ mod tests {
         assert!(screen.contains("q quit"), "{screen}");
         assert!(screen.contains("6 RØDE B"), "{screen}");
         assert!(!screen.contains("Console"), "{screen}");
+    }
+
+    #[test]
+    fn a_console_without_room_for_one_strip_is_left_out() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.set_board(Ok(board_state(true)));
+        // 3 rows free: borders and header, no strip.
+        assert!(!screen_of_height(&app, 14).contains("Console"));
+        assert!(screen_of_height(&app, 15).contains("Mic 1"));
+    }
+
+    #[test]
+    fn a_dump_that_never_comes_drops_the_last_state() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.set_board(Ok(board_state(true)));
+        for _ in 0..10 {
+            app.set_board(Ok(board_state(false)));
+        }
+        assert!(screen(&app).contains("Console (refreshing…)"));
+        app.set_board(Ok(board_state(false)));
+        let screen = screen(&app);
+        assert!(screen.contains(crate::BOARD_BEING_READ), "{screen}");
+        assert!(!screen.contains("F5"), "{screen}");
     }
 }
