@@ -13,8 +13,8 @@ use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -79,14 +79,6 @@ pub(crate) enum DaemonError {
     NoAnswer,
     #[error("the board service closed the connection without answering")]
     Dropped,
-}
-
-impl DaemonError {
-    /// Worth asking again: the service is there but could not answer now.
-    pub(crate) const fn is_transient(&self) -> bool {
-        // A dropped connection is most often a service restarting.
-        matches!(self, Self::Busy | Self::NoAnswer | Self::Dropped)
-    }
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> DaemonError + use<> {
@@ -239,7 +231,13 @@ fn bind(path: &Path) -> Result<UnixListener, DaemonError> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_err(dir))?;
     }
     if let Ok(meta) = fs::symlink_metadata(path) {
-        if !meta.file_type().is_socket() || UnixStream::connect(path).is_ok() {
+        // Refused: nobody listens. Anything else, a frozen instance included
+        // (its backlog full), is someone there.
+        let listened = !matches!(
+            connect_now(path),
+            Err(err) if err.kind() == io::ErrorKind::ConnectionRefused
+        );
+        if !meta.file_type().is_socket() || listened {
             return Err(DaemonError::AlreadyRunning(path.to_owned()));
         }
         // A socket nobody listens on: left over by a killed instance.
@@ -468,7 +466,7 @@ fn check_version(version: u32) -> Result<(), DaemonError> {
 pub(crate) fn query_state() -> Result<StateDto, DaemonError> {
     let path = socket_path()?;
     let deadline = Instant::now() + QUERY_TIMEOUT;
-    let mut stream = connect_by(&path, deadline)?;
+    let mut stream = connect(&path)?;
     let line = exchange(&mut stream, deadline).map_err(|err| answer_err(&path, err))?;
     parse_answer(&line)
 }
@@ -496,36 +494,13 @@ fn time_left(deadline: Instant) -> io::Result<Duration> {
         .ok_or_else(|| io::ErrorKind::TimedOut.into())
 }
 
-/// A connection wanted by a deadline, and where to send it.
-type ConnectRequest = (PathBuf, Instant, mpsc::Sender<io::Result<UnixStream>>);
-
-/// Connects by `deadline`. A service that no longer accepts (frozen, its
-/// backlog full) makes `connect` wait without limit, so connections are made
-/// by one long-lived thread. Requests whose deadline passed while it was
-/// stuck are skipped; the one it was stuck on may still get through once
-/// the service is back, which then sees a client asking nothing.
-fn connect_by(path: &Path, deadline: Instant) -> Result<UnixStream, DaemonError> {
-    static CONNECTOR: OnceLock<mpsc::Sender<ConnectRequest>> = OnceLock::new();
-    let connector = CONNECTOR.get_or_init(|| {
-        let (requests, queue) = mpsc::channel::<ConnectRequest>();
-        thread::spawn(move || {
-            for (path, deadline, reply) in queue {
-                if Instant::now() < deadline {
-                    let _ = reply.send(UnixStream::connect(&path));
-                }
-            }
-        });
-        requests
-    });
-    let (reply, answer) = mpsc::channel();
-    connector
-        .send((path.to_owned(), deadline, reply))
-        .map_err(|_| DaemonError::NoAnswer)?;
-    let left = time_left(deadline).map_err(|_| DaemonError::NoAnswer)?;
-    match answer.recv_timeout(left) {
-        Ok(Ok(stream)) => Ok(stream),
+/// Connects without waiting: a service that no longer accepts (frozen, its
+/// backlog full) would make a blocking `connect` wait without limit.
+fn connect(path: &Path) -> Result<UnixStream, DaemonError> {
+    match connect_now(path) {
+        Ok(stream) => Ok(stream),
         // No socket, or nobody listening on it.
-        Ok(Err(err))
+        Err(err)
             if matches!(
                 err.kind(),
                 io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
@@ -533,9 +508,20 @@ fn connect_by(path: &Path, deadline: Instant) -> Result<UnixStream, DaemonError>
         {
             Err(DaemonError::NotRunning)
         }
-        Ok(Err(err)) => Err(io_err(path)(err)),
-        Err(_) => Err(DaemonError::NoAnswer),
+        // Someone listens but does not take connections now.
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Err(DaemonError::NoAnswer),
+        Err(err) => Err(io_err(path)(err)),
     }
+}
+
+/// A Unix socket `connect` that fails with `WouldBlock` rather than waits
+/// when the listener's backlog is full; the stream is blocking again after.
+fn connect_now(path: &Path) -> io::Result<UnixStream> {
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    socket.connect(&socket2::SockAddr::unix(path)?)?;
+    socket.set_nonblocking(false)?;
+    Ok(UnixStream::from(std::os::fd::OwnedFd::from(socket)))
 }
 
 /// A failed exchange: a timeout means the service could not answer now
@@ -614,7 +600,7 @@ fn parse_answer(line: &str) -> Result<StateDto, DaemonError> {
 mod tests {
     use super::{
         BUSY_ANSWER, DaemonError, PROTOCOL_VERSION, STALE_FOR, Shared, StateDto, answer_err, apply,
-        check_version, exchange, parse_answer, read_answer, turn_away,
+        check_version, connect, exchange, parse_answer, read_answer, turn_away,
     };
     use rcp2_proto::{Change, Node, Var};
     use std::io::Write as _;
@@ -732,9 +718,6 @@ mod tests {
             parse_answer("{\"error\":\"unknown request\"}"),
             Err(DaemonError::BadAnswer(_))
         ));
-        assert!(DaemonError::Busy.is_transient());
-        assert!(DaemonError::NoAnswer.is_transient());
-        assert!(!DaemonError::ServiceOlder.is_transient());
     }
 
     /// Reads from one end of a socket pair, the other end fed by `feed`.
@@ -787,5 +770,33 @@ mod tests {
             .map_err(|err| answer_err(Path::new("test.sock"), err))
             .and_then(|line| parse_answer(&line));
         assert!(matches!(answer, Err(DaemonError::Busy)), "{answer:?}");
+    }
+
+    #[test]
+    fn connecting_never_waits_for_a_service_that_does_not_accept() {
+        let dir = std::env::temp_dir().join(format!("rcp2ctl-connect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("board.sock");
+        assert!(matches!(connect(&path), Err(DaemonError::NotRunning)));
+        // A frozen service: it listens but never accepts, so its backlog
+        // fills; each attempt then fails at once instead of waiting.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let started = Instant::now();
+        let mut held = Vec::new();
+        let full = loop {
+            match connect(&path) {
+                Ok(stream) => held.push(stream),
+                Err(err) => break err,
+            }
+            assert!(held.len() < 10_000, "the backlog never filled");
+        };
+        assert!(matches!(full, DaemonError::NoAnswer), "{full:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Left behind by a killed service: nobody listens on it.
+        drop(listener);
+        assert!(matches!(connect(&path), Err(DaemonError::NotRunning)));
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

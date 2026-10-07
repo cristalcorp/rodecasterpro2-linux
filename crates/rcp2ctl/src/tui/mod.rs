@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{self, Event};
 use rcp2_audio::{Graph, PersistPaths, PwError, persist_state, snapshot};
 
 use self::app::{Action, App, Level};
-use self::board::{BoardIssue, BoardView};
+use self::board::{BoardIssue, BoardView, Patience};
 use self::view::Mode;
 use crate::settings::{self, Settings};
 use crate::{CliError, Switch, outputs, persist, prepare, route, set_default};
@@ -27,9 +27,6 @@ const INPUT_POLL: Duration = Duration::from_millis(100);
 /// A graph snapshot and when it was started: older ones are ignored.
 type Snapshot = (Instant, Result<Graph, PwError>);
 
-/// What a poll brought, and when it ended.
-type BoardPoll = (Instant, BoardView);
-
 /// Asks the board service for the board state.
 fn board_view() -> BoardView {
     crate::daemon::query_state().map_err(|err| BoardIssue::from(&err))
@@ -37,13 +34,11 @@ fn board_view() -> BoardView {
 
 /// Asks the board service for the board state every second, on its own
 /// thread: a slow service never delays the graph or the keyboard.
-fn spawn_board_watcher() -> Receiver<BoardPoll> {
+fn spawn_board_watcher() -> Receiver<BoardView> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         loop {
-            let view = board_view();
-            // Timed when the poll ends, not when the screen gets to it.
-            if sender.send((Instant::now(), view)).is_err() {
+            if sender.send(board_view()).is_err() {
                 break;
             }
             thread::sleep(REFRESH_EVERY);
@@ -108,7 +103,7 @@ fn event_loop(
     settings_path: &Path,
     requests: &Sender<()>,
     snapshots: &Receiver<Snapshot>,
-    boards: &Receiver<BoardPoll>,
+    boards: &Receiver<BoardView>,
 ) -> Result<(), CliError> {
     let (mut mode, error) = current_mode(settings);
     if let Some(error) = error {
@@ -124,15 +119,15 @@ fn event_loop(
 
         while !watcher_gone {
             match boards.try_recv() {
-                Ok((ended, board)) => app.console.record(board, ended),
+                Ok(board) => app.console.record(board),
                 Err(TryRecvError::Empty) => break,
                 // Its thread is gone: say so rather than show a frozen state.
                 Err(TryRecvError::Disconnected) => {
                     let issue = BoardIssue {
                         text: "The board service is no longer asked: restart rcp2ctl.".to_owned(),
-                        transient: false,
+                        patience: Patience::None,
                     };
-                    app.console.record(Err(issue), Instant::now());
+                    app.console.record(Err(issue));
                     watcher_gone = true;
                 }
             }

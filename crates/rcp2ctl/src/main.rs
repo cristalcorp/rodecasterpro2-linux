@@ -1086,15 +1086,15 @@ fn print_board(
     Ok(())
 }
 
-/// Asks the board service, again a few times while it says it is busy or
-/// hangs up (restarting); asking again while it does not answer at all
-/// would only wait longer.
+/// Asks the board service, again a few times while it says it is busy;
+/// asking again while it does not answer at all would only wait longer, and
+/// one that hung up is said as is (a restart takes longer than these tries).
 fn query_board() -> Result<daemon::StateDto, daemon::DaemonError> {
     const ATTEMPTS: u32 = 3;
     let mut attempt = 1;
     loop {
         match daemon::query_state() {
-            Err(daemon::DaemonError::Busy | daemon::DaemonError::Dropped) if attempt < ATTEMPTS => {
+            Err(daemon::DaemonError::Busy) if attempt < ATTEMPTS => {
                 attempt += 1;
                 std::thread::sleep(Duration::from_secs(1));
             }

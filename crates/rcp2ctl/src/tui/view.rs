@@ -26,7 +26,9 @@ pub(crate) struct Mode {
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
     let board = app.console.shown();
-    let lines = console_lines(board, frame.area().width.saturating_sub(2));
+    // Inside the console's borders.
+    let inner_width = usize::from(frame.area().width.saturating_sub(2).max(1));
+    let lines = console_lines(board, inner_width);
     // The console never takes the room of the body, the message or the keys,
     // and is left out when even its borders and one line do not fit.
     let room = frame.area().height.saturating_sub(1 + MIN_BODY + 1 + 1);
@@ -36,7 +38,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
     let lines = cut_lines(
         lines,
         usize::from(console_height.saturating_sub(2)),
-        usize::from(frame.area().width.saturating_sub(2)),
+        inner_width,
     );
     let [header, body, console, message, keys] = Layout::vertical([
         Constraint::Length(1),
@@ -178,11 +180,10 @@ fn console_heights(board: &BoardShown, message_lines: usize) -> (u16, u16) {
 /// A message cut into lines of at most `width` columns, at spaces (a word
 /// longer than a line keeps its own line); nothing for the strips. Done per
 /// frame as it depends on the width, and costs a few words.
-fn console_lines(board: &BoardShown, width: u16) -> Vec<String> {
+fn console_lines(board: &BoardShown, width: usize) -> Vec<String> {
     let BoardShown::Message(text) = board else {
         return Vec::new();
     };
-    let width = usize::from(width.max(1));
     let mut lines: Vec<String> = Vec::new();
     // Width of the last line, kept rather than measured again per word.
     let mut used = 0;
@@ -216,14 +217,13 @@ fn console_lines(board: &BoardShown, width: u16) -> Vec<String> {
 }
 
 /// Keeps the first `rows` lines, the last of them ending with "…" when
-/// some had to go (a character gives way only if the line is full).
+/// some had to go (characters give way until it fits; one of no width, such
+/// as a combining mark, frees no room on its own).
 fn cut_lines(mut lines: Vec<String>, rows: usize, width: usize) -> Vec<String> {
     if lines.len() > rows {
         lines.truncate(rows);
         if let Some(last) = lines.last_mut() {
-            if Span::raw(last.as_str()).width() + 1 > width {
-                last.pop();
-            }
+            while Span::raw(last.as_str()).width() + 1 > width && last.pop().is_some() {}
             last.push('…');
         }
     }
@@ -417,7 +417,6 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use rcp2_audio::{Channel, Graph, PersistState};
-    use std::time::Instant;
 
     const DUMP: &str = include_str!("../../../rcp2-audio/tests/fixtures/pw-dump.json");
 
@@ -465,7 +464,7 @@ mod tests {
     #[test]
     fn a_short_terminal_keeps_the_message_and_keys_lines() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.console.record(Ok(board_state(true)), Instant::now());
+        app.console.record(Ok(board_state(true)));
         app.message = Some((crate::tui::app::Level::Info, "hello there".to_owned()));
         let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
         let mode = Mode {
@@ -506,7 +505,7 @@ mod tests {
         let rows = u16::try_from(Channel::ALL.len()).unwrap() + 2;
         assert_eq!(MIN_BODY, rows);
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.console.record(Ok(board_state(true)), Instant::now());
+        app.console.record(Ok(board_state(true)));
         // The console wants 10 rows here; the body keeps its 8.
         let screen = screen_of_height(&app, 20);
         assert!(screen.contains("6 RØDE B"), "{screen}");
@@ -516,7 +515,7 @@ mod tests {
     #[test]
     fn a_tiny_terminal_leaves_the_console_out() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.console.record(Ok(board_state(true)), Instant::now());
+        app.console.record(Ok(board_state(true)));
         app.message = Some((crate::tui::app::Level::Info, "hello there".to_owned()));
         let screen = screen_of_height(&app, 12);
         assert!(screen.contains("hello there"), "{screen}");
@@ -528,7 +527,7 @@ mod tests {
     #[test]
     fn a_console_without_room_for_one_strip_is_left_out() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.console.record(Ok(board_state(true)), Instant::now());
+        app.console.record(Ok(board_state(true)));
         // 3 rows free: borders and header, no strip.
         assert!(!screen_of_height(&app, 14).contains("Console"));
         assert!(screen_of_height(&app, 15).contains("Mic 1"));
@@ -537,7 +536,7 @@ mod tests {
     #[test]
     fn shows_the_board_and_the_fader_of_each_output() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.console.record(Ok(board_state(true)), Instant::now());
+        app.console.record(Ok(board_state(true)));
         let screen = screen(&app);
         assert!(screen.contains("3 RØDE Game   ♪1 ★ F5"), "{screen}");
         assert!(screen.contains("F1"), "{screen}");
@@ -556,7 +555,7 @@ mod tests {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
         let mut state = board_state(true);
         state.refreshing = true;
-        app.console.record(Ok(state), Instant::now());
+        app.console.record(Ok(state));
         let screen = screen(&app);
         assert!(screen.contains("Console (refreshing…)"), "{screen}");
         assert!(screen.contains("F5"), "{screen}");
@@ -566,7 +565,7 @@ mod tests {
     fn a_long_message_wraps_instead_of_being_cut() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
         let issue = BoardIssue::from(&DaemonError::ServiceOlder);
-        app.console.record(Err(issue.clone()), Instant::now());
+        app.console.record(Err(issue.clone()));
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
         let mode = Mode {
             outputs_on: true,
@@ -588,11 +587,11 @@ mod tests {
     #[test]
     fn an_unplugged_board_leaves_no_fader_on_the_outputs() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.console.record(Ok(board_state(true)), Instant::now());
-        assert!(screen(&app).contains("F5"));
+        app.console.record(Ok(board_state(true)));
+        assert!(screen(&app).contains("★ F5"));
         let mut unplugged = board_state(false);
         unplugged.connected = false;
-        app.console.record(Ok(unplugged), Instant::now());
+        app.console.record(Ok(unplugged));
         let screen = screen(&app);
         assert!(screen.contains(crate::BOARD_NOT_CONNECTED), "{screen}");
         assert!(!screen.contains("F5"), "{screen}");
@@ -605,6 +604,9 @@ mod tests {
         assert_eq!(super::cut_lines(lines.clone(), 3, 10), lines);
         assert_eq!(super::cut_lines(lines.clone(), 2, 10), vec!["one", "two…"]);
         assert_eq!(super::cut_lines(lines, 2, 3), vec!["one", "tw…"]);
+        // A combining mark ending a full line gives way with its letter.
+        let marked = vec!["one".to_owned(), "abe\u{301}".to_owned(), "x".to_owned()];
+        assert_eq!(super::cut_lines(marked, 2, 3), vec!["one", "ab…"]);
     }
 
     #[test]
@@ -620,7 +622,7 @@ mod tests {
     fn a_message_without_room_to_wrap_keeps_the_body() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
         let issue = BoardIssue::from(&DaemonError::ServiceOlder);
-        app.console.record(Err(issue), Instant::now());
+        app.console.record(Err(issue));
         let screen = screen_of_height(&app, 14);
         assert!(screen.contains("6 RØDE B"), "{screen}");
         assert!(screen.contains("q quit"), "{screen}");
