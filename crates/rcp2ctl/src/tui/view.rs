@@ -32,6 +32,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &App, mode: Mode) {
     let room = frame.area().height.saturating_sub(1 + MIN_BODY + 1 + 1);
     let (least, wanted) = console_heights(board, lines.len());
     let console_height = if room < least { 0 } else { wanted.min(room) };
+    // A message cut short says so on its last line.
+    let lines = cut_lines(lines, usize::from(console_height.saturating_sub(2)));
     let [header, body, console, message, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(MIN_BODY),
@@ -135,9 +137,12 @@ fn render_outputs(frame: &mut Frame<'_>, app: &App, board: &BoardShown, area: Re
             if default == Some(channel) {
                 spans.push(Span::styled(" ★", Style::new().fg(ACCENT)));
             }
-            for fader in board.faders_of(channel) {
+            // Compact, so several faders fit the panel: " F2,5,9".
+            let faders = board.faders_of(channel);
+            if !faders.is_empty() {
+                let list: Vec<String> = faders.iter().map(ToString::to_string).collect();
                 spans.push(Span::styled(
-                    format!(" F{fader}"),
+                    format!(" F{}", list.join(",")),
                     Style::new().fg(Color::DarkGray),
                 ));
             }
@@ -192,7 +197,7 @@ fn console_lines(board: &BoardShown, width: u16) -> Vec<String> {
         lines.push(String::new());
         used = 0;
         for ch in word.chars() {
-            let ch_width = Span::raw(ch.to_string()).width();
+            let ch_width = Span::raw(&*ch.encode_utf8(&mut [0; 4])).width();
             if used > 0 && used + ch_width > width {
                 lines.push(String::new());
                 used = 0;
@@ -201,6 +206,19 @@ fn console_lines(board: &BoardShown, width: u16) -> Vec<String> {
                 line.push(ch);
             }
             used += ch_width;
+        }
+    }
+    lines
+}
+
+/// Keeps the first `rows` lines, the last of them ending with "…" when
+/// some had to go.
+fn cut_lines(mut lines: Vec<String>, rows: usize) -> Vec<String> {
+    if lines.len() > rows {
+        lines.truncate(rows);
+        if let Some(last) = lines.last_mut() {
+            last.pop();
+            last.push('…');
         }
     }
     lines
@@ -559,6 +577,13 @@ mod tests {
         let squeezed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let shown = squeezed(&text.replace('│', " "));
         assert!(shown.contains(&squeezed(&issue.text)), "{shown}");
+    }
+
+    #[test]
+    fn a_message_cut_short_says_so() {
+        let lines = vec!["one".to_owned(), "two".to_owned(), "three".to_owned()];
+        assert_eq!(super::cut_lines(lines.clone(), 3), lines);
+        assert_eq!(super::cut_lines(lines, 2), vec!["one", "tw…"]);
     }
 
     #[test]

@@ -137,7 +137,6 @@ fn event_loop(
                 }
             }
         }
-        app.console.tick(Instant::now());
         while let Ok((started, refresh)) = snapshots.try_recv() {
             if started < fresh_after {
                 continue;

@@ -9,23 +9,13 @@ use rcp2_proto::InputSource;
 use crate::daemon::{DaemonError, QUERY_TIMEOUT, StateDto};
 use crate::{BOARD_BEING_READ, BOARD_NOT_CONNECTED};
 
-/// When the next answer is due at the latest: one poll interval, then a
-/// poll that runs out of time. Past it the last answer is marked refreshing.
-pub(crate) const ANSWER_DUE: Duration = super::REFRESH_EVERY.saturating_add(QUERY_TIMEOUT);
-/// How long the last answer is still shown when no newer one has come: one
-/// more poll as margin. Past it the panel says the service does not answer,
-/// even if the poll itself is stuck and never reports.
-pub(crate) const ANSWER_GRACE: Duration = ANSWER_DUE.saturating_add(QUERY_TIMEOUT);
-
-/// How old the last answer (or the asking, before any) is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Age {
-    Current,
-    /// The next answer is late: shown, marked refreshing.
-    Late,
-    /// Too late: no longer shown.
-    Expired,
-}
+/// How long the last answer is still shown through polls that fail for a
+/// passing reason: one poll interval and one poll that runs out of time,
+/// then one more of each as margin. Every poll is bounded by
+/// `QUERY_TIMEOUT`, so failures keep being reported meanwhile.
+pub(crate) const ANSWER_GRACE: Duration = super::REFRESH_EVERY
+    .saturating_add(QUERY_TIMEOUT)
+    .saturating_mul(2);
 
 const NO_CHANNEL: &str = "No channel is assigned on the board.";
 const ASKING: &str = "Asking the board service…";
@@ -119,22 +109,13 @@ const fn channel_source(channel: Channel) -> Option<InputSource> {
 pub(crate) struct Console {
     /// The last answer, and when its poll ended.
     answer: Option<(Instant, StateDto)>,
-    /// Why the polls since that answer failed, if they did.
-    failure: Option<BoardIssue>,
-    /// When the asking started.
-    since: Instant,
-    /// The age at the last look: the panel changes only when it does.
-    age: Age,
     shown: BoardShown,
 }
 
 impl Console {
-    pub(crate) fn new(now: Instant) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             answer: None,
-            failure: None,
-            since: now,
-            age: Age::Current,
             shown: BoardShown::Message(ASKING.to_owned()),
         }
     }
@@ -143,58 +124,29 @@ impl Console {
         &self.shown
     }
 
-    /// Records what a poll that ended at `ended` brought.
+    /// Records what a poll that ended at `ended` brought, and decides the
+    /// panel: a passing failure keeps the last answer for a while, marked
+    /// refreshing; anything else is said at once.
     pub(crate) fn record(&mut self, view: BoardView, ended: Instant) {
-        match view {
+        self.shown = match view {
             Ok(state) => {
+                let shown = from_state(&state, false);
                 self.answer = Some((ended, state));
-                self.failure = None;
+                shown
             }
-            Err(issue) => self.failure = Some(issue),
-        }
-        self.age = self.age_at(ended);
-        self.shown = self.decide();
-    }
-
-    /// Looks at the time: an answer too old means the service no longer
-    /// answers, even when no poll reports it. Cheap when nothing changes.
-    pub(crate) fn tick(&mut self, now: Instant) {
-        let age = self.age_at(now);
-        if age != self.age {
-            self.age = age;
-            self.shown = self.decide();
-        }
-    }
-
-    fn age_at(&self, now: Instant) -> Age {
-        let last = self.answer.as_ref().map_or(self.since, |(at, _)| *at);
-        match now.saturating_duration_since(last) {
-            age if age < ANSWER_DUE => Age::Current,
-            age if age < ANSWER_GRACE => Age::Late,
-            _ => Age::Expired,
-        }
-    }
-
-    fn decide(&self) -> BoardShown {
-        let expired = self.age == Age::Expired;
-        match (&self.failure, &self.answer) {
-            // A lasting failure, one not worth waiting through, or one with
-            // nothing to keep showing, is said.
-            (Some(issue), answer) if !issue.transient || expired || answer.is_none() => {
-                BoardShown::Message(issue.text.clone())
-            }
-            (failure, Some((_, state))) if !expired => {
-                from_state(state, failure.is_some() || self.age == Age::Late)
-            }
-            (None, None) if !expired => BoardShown::Message(ASKING.to_owned()),
-            // Nothing for too long: the poll itself is stuck.
-            _ => BoardShown::Message(sentence(&DaemonError::NoAnswer.to_string())),
-        }
+            Err(issue) => match &self.answer {
+                Some((at, state))
+                    if issue.transient && ended.saturating_duration_since(*at) < ANSWER_GRACE =>
+                {
+                    from_state(state, true)
+                }
+                _ => BoardShown::Message(issue.text),
+            },
+        };
     }
 }
 
-/// The panel for an answer; `unanswered` when later polls failed or the
-/// next answer is late.
+/// The panel for an answer; `unanswered` when later polls failed.
 fn from_state(state: &StateDto, unanswered: bool) -> BoardShown {
     if !state.connected {
         return BoardShown::Message(BOARD_NOT_CONNECTED.to_owned());
@@ -227,7 +179,7 @@ fn from_state(state: &StateDto, unanswered: bool) -> BoardShown {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{ANSWER_DUE, ANSWER_GRACE, BoardIssue, BoardShown, Console};
+    use super::{ANSWER_GRACE, BoardIssue, BoardShown, Console};
     use crate::daemon::{ChannelDto, DaemonError, PROTOCOL_VERSION, QUERY_TIMEOUT, StateDto};
     use crate::tui::REFRESH_EVERY;
     use rcp2_audio::Channel;
@@ -324,16 +276,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_poll_that_runs_out_of_time_keeps_the_last_state_for_a_moment() {
+    fn passing_failures_keep_the_last_state_for_a_while() {
         let start = Instant::now();
-        let mut console = Console::new(start);
+        let mut console = Console::new();
         console.record(Ok(board_state(true)), start);
         assert_eq!(refreshing(&console), Some(false));
-        // A real poll that runs out of time ends this long after the answer.
-        let timed_out = start + REFRESH_EVERY + QUERY_TIMEOUT;
-        console.record(Err(issue(&DaemonError::NoAnswer)), timed_out);
+        // Polls that run out of time end one interval and a timeout apart.
+        let poll = REFRESH_EVERY + QUERY_TIMEOUT;
+        console.record(Err(issue(&DaemonError::NoAnswer)), start + poll);
         assert_eq!(refreshing(&console), Some(true));
-        console.tick(start + ANSWER_GRACE);
+        console.record(
+            Err(issue(&DaemonError::Dropped)),
+            start + poll + QUERY_TIMEOUT,
+        );
+        assert_eq!(refreshing(&console), Some(true));
+        console.record(Err(issue(&DaemonError::NoAnswer)), start + ANSWER_GRACE);
         assert_eq!(text(&console), "The board service did not answer in time.");
         console.record(Ok(board_state(true)), start + ANSWER_GRACE);
         assert_eq!(refreshing(&console), Some(false));
@@ -342,7 +299,7 @@ pub(crate) mod tests {
     #[test]
     fn a_busy_service_keeps_a_message_too() {
         let start = Instant::now();
-        let mut console = Console::new(start);
+        let mut console = Console::new();
         console.record(Ok(board_state(false)), start);
         console.record(Err(issue(&DaemonError::Busy)), start + REFRESH_EVERY);
         assert_eq!(text(&console), crate::BOARD_BEING_READ);
@@ -351,35 +308,21 @@ pub(crate) mod tests {
     #[test]
     fn a_lasting_failure_is_said_at_once() {
         let start = Instant::now();
-        let mut console = Console::new(start);
+        let mut console = Console::new();
         console.record(Ok(board_state(true)), start);
         console.record(Err(issue(&DaemonError::ServiceNewer)), start);
         assert!(text(&console).starts_with("The board service is newer"));
-    }
-
-    #[test]
-    fn a_stuck_poll_is_noticed_without_any_report() {
-        let start = Instant::now();
-        let mut console = Console::new(start);
-        console.record(Ok(board_state(true)), start);
-        // No poll ever reports again.
-        console.tick(start + QUERY_TIMEOUT);
-        assert_eq!(refreshing(&console), Some(false));
-        console.tick(start + ANSWER_DUE);
-        assert_eq!(refreshing(&console), Some(true));
-        console.tick(start + ANSWER_GRACE);
-        assert_eq!(text(&console), "The board service did not answer in time.");
-        // Same from the start, before any answer.
-        let mut console = Console::new(start);
+        // A passing one with nothing to keep is said too.
+        let mut console = Console::new();
         assert_eq!(text(&console), super::ASKING);
-        console.tick(start + ANSWER_GRACE);
-        assert_eq!(text(&console), "The board service did not answer in time.");
+        console.record(Err(issue(&DaemonError::Busy)), start);
+        assert_eq!(text(&console), "The board service is busy.");
     }
 
     #[test]
     fn the_service_refreshing_is_shown() {
         let start = Instant::now();
-        let mut console = Console::new(start);
+        let mut console = Console::new();
         let mut state = board_state(true);
         state.refreshing = true;
         console.record(Ok(state), start);
@@ -389,7 +332,7 @@ pub(crate) mod tests {
     #[test]
     fn says_why_there_are_no_strips() {
         let start = Instant::now();
-        let mut console = Console::new(start);
+        let mut console = Console::new();
         let mut unplugged = board_state(false);
         unplugged.connected = false;
         console.record(Ok(unplugged), start);
@@ -403,7 +346,7 @@ pub(crate) mod tests {
     #[test]
     fn an_output_on_several_faders_lists_them_all() {
         let start = Instant::now();
-        let mut console = Console::new(start);
+        let mut console = Console::new();
         let mut state = board_state(true);
         // Game on the strips of faders 2 and 5.
         if let Some(channel) = state.channels.get_mut(1) {

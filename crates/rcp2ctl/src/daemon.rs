@@ -32,7 +32,8 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Version of the socket protocol.
 /// 2: channels carry their source code, fader levels may be unreadable.
 /// 3: the previous state is kept, marked refreshing, while a new dump is read.
-pub(crate) const PROTOCOL_VERSION: u32 = 3;
+/// 4: a client turned away is told so (`{"error":"busy"}`, no version).
+pub(crate) const PROTOCOL_VERSION: u32 = 4;
 /// How long the previous state is still served while a new dump is awaited:
 /// a dump takes a moment, one that never comes must not leave old values.
 const STALE_FOR: Duration = Duration::from_secs(15);
@@ -76,12 +77,15 @@ pub(crate) enum DaemonError {
     Busy,
     #[error("the board service did not answer in time")]
     NoAnswer,
+    #[error("the board service closed the connection without answering")]
+    Dropped,
 }
 
 impl DaemonError {
     /// Worth asking again: the service is there but could not answer now.
     pub(crate) const fn is_transient(&self) -> bool {
-        matches!(self, Self::Busy | Self::NoAnswer)
+        // A dropped connection is most often a service restarting.
+        matches!(self, Self::Busy | Self::NoAnswer | Self::Dropped)
     }
 }
 
@@ -395,12 +399,7 @@ fn serve(listener: &UnixListener, shared: &SharedState) {
         };
         if active.fetch_add(1, Ordering::SeqCst) >= MAX_CLIENTS {
             active.fetch_sub(1, Ordering::SeqCst);
-            // Said rather than hung up on, so the client knows to ask again;
-            // a fresh socket takes one short line without blocking.
-            let mut stream = stream;
-            let _ = stream
-                .set_nonblocking(true)
-                .and_then(|()| writeln!(stream, "{BUSY_ANSWER}"));
+            turn_away(stream);
             continue;
         }
         let shared = Arc::clone(shared);
@@ -412,6 +411,14 @@ fn serve(listener: &UnixListener, shared: &SharedState) {
             let _ = answer(stream, &shared);
         });
     }
+}
+
+/// Tells a client it is turned away rather than hanging up on it, so it
+/// knows to ask again; a fresh socket takes one short line without blocking.
+fn turn_away(mut stream: UnixStream) {
+    let _ = stream
+        .set_nonblocking(true)
+        .and_then(|()| writeln!(stream, "{BUSY_ANSWER}"));
 }
 
 /// One client being served: frees its place when dropped.
@@ -427,7 +434,10 @@ fn answer(stream: UnixStream, shared: &SharedState) -> io::Result<()> {
     stream.set_read_timeout(Some(CLIENT_TIMEOUT))?;
     stream.set_write_timeout(Some(CLIENT_TIMEOUT))?;
     let mut request = String::new();
-    BufReader::new((&stream).take(MAX_REQUEST)).read_line(&mut request)?;
+    if BufReader::new((&stream).take(MAX_REQUEST)).read_line(&mut request)? == 0 {
+        // Nothing asked: a client that gave up before it was let in.
+        return Ok(());
+    }
     let mut stream = stream;
     if request.trim() != "state" {
         return writeln!(stream, "{{\"error\":\"unknown request\"}}");
@@ -459,9 +469,13 @@ pub(crate) fn query_state() -> Result<StateDto, DaemonError> {
     let path = socket_path()?;
     let deadline = Instant::now() + QUERY_TIMEOUT;
     let mut stream = connect_by(&path, deadline)?;
-    stream
-        .set_write_timeout(Some(time_left(deadline)?))
-        .map_err(io_err(&path))?;
+    let line = exchange(&mut stream, deadline).map_err(|err| answer_err(&path, err))?;
+    parse_answer(&line)
+}
+
+/// Sends the request and reads the answer line, all by `deadline`.
+fn exchange(stream: &mut UnixStream, deadline: Instant) -> io::Result<String> {
+    stream.set_write_timeout(Some(time_left(deadline)?))?;
     // A busy service answers and hangs up without reading: the request may
     // then fail to go out, but its answer is there to read.
     if let Err(err) = writeln!(stream, "state")
@@ -470,17 +484,16 @@ pub(crate) fn query_state() -> Result<StateDto, DaemonError> {
             io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
         )
     {
-        return Err(answer_err(&path, err));
+        return Err(err);
     }
-    let line = read_answer(&mut stream, deadline).map_err(|err| answer_err(&path, err))?;
-    parse_answer(&line)
+    read_answer(stream, deadline)
 }
 
-/// Time left before `deadline`, if any: none is no answer in time.
-fn time_left(deadline: Instant) -> Result<Duration, DaemonError> {
+/// Time left before `deadline`; none is a timeout.
+fn time_left(deadline: Instant) -> io::Result<Duration> {
     Some(deadline.saturating_duration_since(Instant::now()))
         .filter(|left| !left.is_zero())
-        .ok_or(DaemonError::NoAnswer)
+        .ok_or_else(|| io::ErrorKind::TimedOut.into())
 }
 
 /// A connection wanted by a deadline, and where to send it.
@@ -488,10 +501,11 @@ type ConnectRequest = (PathBuf, Instant, mpsc::Sender<io::Result<UnixStream>>);
 
 /// Connects by `deadline`. A service that no longer accepts (frozen, its
 /// backlog full) makes `connect` wait without limit, so connections are made
-/// by one long-lived thread; requests whose deadline passed while it was
-/// stuck are dropped, not replayed at the service once it is back.
+/// by one long-lived thread. Requests whose deadline passed while it was
+/// stuck are skipped; the one it was stuck on may still get through once
+/// the service is back, which then sees a client asking nothing.
 fn connect_by(path: &Path, deadline: Instant) -> Result<UnixStream, DaemonError> {
-    static CONNECTOR: OnceLock<Mutex<mpsc::Sender<ConnectRequest>>> = OnceLock::new();
+    static CONNECTOR: OnceLock<mpsc::Sender<ConnectRequest>> = OnceLock::new();
     let connector = CONNECTOR.get_or_init(|| {
         let (requests, queue) = mpsc::channel::<ConnectRequest>();
         thread::spawn(move || {
@@ -501,17 +515,25 @@ fn connect_by(path: &Path, deadline: Instant) -> Result<UnixStream, DaemonError>
                 }
             }
         });
-        Mutex::new(requests)
+        requests
     });
     let (reply, answer) = mpsc::channel();
     connector
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
         .send((path.to_owned(), deadline, reply))
         .map_err(|_| DaemonError::NoAnswer)?;
-    match answer.recv_timeout(time_left(deadline)?) {
+    let left = time_left(deadline).map_err(|_| DaemonError::NoAnswer)?;
+    match answer.recv_timeout(left) {
         Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(_)) => Err(DaemonError::NotRunning),
+        // No socket, or nobody listening on it.
+        Ok(Err(err))
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Err(DaemonError::NotRunning)
+        }
+        Ok(Err(err)) => Err(io_err(path)(err)),
         Err(_) => Err(DaemonError::NoAnswer),
     }
 }
@@ -524,9 +546,7 @@ fn answer_err(path: &Path, err: io::Error) -> DaemonError {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => DaemonError::NoAnswer,
         io::ErrorKind::ConnectionReset
         | io::ErrorKind::BrokenPipe
-        | io::ErrorKind::UnexpectedEof => {
-            DaemonError::BadAnswer("the connection closed before the answer".to_owned())
-        }
+        | io::ErrorKind::UnexpectedEof => DaemonError::Dropped,
         io::ErrorKind::InvalidData => DaemonError::BadAnswer(err.to_string()),
         _ => io_err(path)(err),
     }
@@ -539,11 +559,7 @@ fn read_answer(stream: &mut UnixStream, deadline: Instant) -> io::Result<String>
     let mut chunk = [0_u8; 4096];
     let mut complete = false;
     while !complete {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        stream.set_read_timeout(Some(left))?;
+        stream.set_read_timeout(Some(time_left(deadline)?))?;
         match stream.read(&mut chunk) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(read) => {
@@ -598,7 +614,7 @@ fn parse_answer(line: &str) -> Result<StateDto, DaemonError> {
 mod tests {
     use super::{
         BUSY_ANSWER, DaemonError, PROTOCOL_VERSION, STALE_FOR, Shared, StateDto, answer_err, apply,
-        check_version, parse_answer, read_answer,
+        check_version, exchange, parse_answer, read_answer, turn_away,
     };
     use rcp2_proto::{Change, Node, Var};
     use std::io::Write as _;
@@ -743,12 +759,10 @@ mod tests {
         );
         assert!(matches!(slow, Err(DaemonError::NoAnswer)), "{slow:?}");
         assert!(started.elapsed() < Duration::from_secs(1));
-        // Hung up without a word: a broken answer (a busy service says so).
+        // Hung up without a word (a busy service says so): most often a
+        // service restarting.
         let dropped = read_from(drop, Duration::from_secs(1));
-        assert!(
-            matches!(dropped, Err(DaemonError::BadAnswer(_))),
-            "{dropped:?}"
-        );
+        assert!(matches!(dropped, Err(DaemonError::Dropped)), "{dropped:?}");
         let garbled = read_from(
             |mut theirs| theirs.write_all(b"\xff\n").unwrap(),
             Duration::from_secs(1),
@@ -762,5 +776,16 @@ mod tests {
             Duration::from_secs(1),
         );
         assert_eq!(whole.unwrap(), "{}\n");
+    }
+
+    #[test]
+    fn a_turned_away_client_reads_busy_even_if_its_request_fails() {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        // The service answers busy and hangs up before the request is sent.
+        turn_away(theirs);
+        let answer = exchange(&mut ours, Instant::now() + Duration::from_secs(1))
+            .map_err(|err| answer_err(Path::new("test.sock"), err))
+            .and_then(|line| parse_answer(&line));
+        assert!(matches!(answer, Err(DaemonError::Busy)), "{answer:?}");
     }
 }

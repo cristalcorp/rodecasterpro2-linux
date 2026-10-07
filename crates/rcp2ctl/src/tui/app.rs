@@ -1,7 +1,5 @@
 //! TUI state and key handling: pure, no I/O, so it is tested without a terminal.
 
-use std::time::Instant;
-
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use rcp2_audio::{Channel, Graph};
 
@@ -61,7 +59,7 @@ impl App {
             output_selected: 0,
             message: None,
             show_help: false,
-            console: Console::new(Instant::now()),
+            console: Console::new(),
         }
     }
 
