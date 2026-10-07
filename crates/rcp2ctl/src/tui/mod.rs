@@ -21,6 +21,9 @@ use crate::{CliError, Switch, outputs, persist, prepare, route, set_default};
 
 /// How often the graph is re-read when nothing happens.
 pub(crate) const REFRESH_EVERY: Duration = Duration::from_secs(1);
+/// How often the board service is asked: often enough for a moving fader to
+/// look live (its state is in memory, so an answer is cheap).
+pub(crate) const BOARD_EVERY: Duration = Duration::from_millis(250);
 /// How long to wait for a key before handling background refreshes.
 const INPUT_POLL: Duration = Duration::from_millis(100);
 
@@ -32,8 +35,8 @@ fn board_view() -> BoardView {
     crate::daemon::query_state().map_err(|err| BoardIssue::from(&err))
 }
 
-/// Asks the board service for the board state every second, on its own
-/// thread: a slow service never delays the graph or the keyboard.
+/// Asks the board service for the board state every [`BOARD_EVERY`], on its
+/// own thread: a slow service never delays the graph or the keyboard.
 fn spawn_board_watcher() -> Receiver<BoardView> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
@@ -41,7 +44,7 @@ fn spawn_board_watcher() -> Receiver<BoardView> {
             if sender.send(board_view()).is_err() {
                 break;
             }
-            thread::sleep(REFRESH_EVERY);
+            thread::sleep(BOARD_EVERY);
         }
     });
     receiver

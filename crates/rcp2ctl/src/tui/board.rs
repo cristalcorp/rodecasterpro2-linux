@@ -13,24 +13,27 @@ use crate::{BOARD_BEING_READ, BOARD_NOT_CONNECTED};
 /// How long a restarted service takes to listen again after systemd starts
 /// it (its first look at the board is then told by `starting`).
 const LAUNCH_MARGIN: Duration = Duration::from_secs(1);
+/// Polls needed to cover `wait`, at one poll every `BOARD_EVERY` at least.
+const fn polls_in(wait: Duration) -> u128 {
+    wait.as_millis().div_ceil(super::BOARD_EVERY.as_millis())
+}
+
 /// Failed polls in a row through which the last answer is still shown, by
 /// kind of failure (see `05-Etats-et-flux`, table T). Counted rather than
-/// timed, so late polls cannot shorten the wait.
-/// Hung up or absent: a crashed service is restarted (polls are at least
-/// `REFRESH_EVERY` apart, plus the one that saw it go).
-const RESTART_POLLS: u128 = 1 + RESTART_AFTER
-    .saturating_add(LAUNCH_MARGIN)
-    .as_millis()
-    .div_ceil(super::REFRESH_EVERY.as_millis());
+/// timed, so late polls cannot shorten the wait; given as durations, so they
+/// follow the polling pace.
+/// Hung up or absent: a crashed service is restarted (the poll that saw it
+/// go, then until it listens again).
+const RESTART_POLLS: u128 = 1 + polls_in(RESTART_AFTER.saturating_add(LAUNCH_MARGIN));
 /// Busy: a few seconds of load.
-const BUSY_POLLS: u128 = 6;
+const BUSY_POLLS: u128 = polls_in(Duration::from_secs(6));
 /// No answer in time: each such poll lasts up to `QUERY_TIMEOUT`, so a
-/// frozen service is said after two.
+/// frozen service is said after two, whatever the pace.
 const TIMED_OUT_POLLS: u128 = 2;
 /// Polls in a row without a read board through which the last one is still
 /// shown, whatever the answers (T8): a service that keeps crashing, or keeps
 /// starting, is said in the end.
-const UNREAD_POLLS: u128 = 20;
+const UNREAD_POLLS: u128 = polls_in(Duration::from_secs(20));
 
 const NO_CHANNEL: &str = "No channel is assigned on the board.";
 const ASKING: &str = "Asking the board service…";
@@ -426,9 +429,22 @@ pub(crate) mod tests {
             console.record(failed(&DaemonError::NotRunning));
             assert!(text(&console).starts_with("The board service is not running"));
         }
-        // Enough for systemd's delay: the poll that saw it go, then one a
-        // second until it listens.
-        assert!(RESTART_POLLS > crate::service::RESTART_AFTER.as_millis() / 1000);
+    }
+
+    /// T2, T4, T8: the limits last as long as the table says, whatever the
+    /// polling pace.
+    #[test]
+    fn the_limits_are_durations() {
+        let lasts = |polls: u128| super::super::BOARD_EVERY.as_millis() * polls;
+        assert!(lasts(BUSY_POLLS) >= 6_000);
+        assert!(lasts(UNREAD_POLLS) >= 20_000);
+        // The poll that saw it go, then systemd's delay and the launch.
+        let restart = crate::service::RESTART_AFTER.as_millis() + 1_000;
+        assert!(lasts(RESTART_POLLS - 1) >= restart);
+        // Not much longer either: one poll's rounding at most.
+        assert!(lasts(BUSY_POLLS - 1) < 6_000);
+        assert!(lasts(UNREAD_POLLS - 1) < 20_000);
+        assert!(lasts(RESTART_POLLS - 2) < restart);
     }
 
     #[test]
