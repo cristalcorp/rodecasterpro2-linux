@@ -1102,11 +1102,15 @@ fn board(out: &mut impl Write) -> Result<(), CliError> {
         .map(|channel| (channel.index, channel.source.clone(), channel.muted))
         .collect();
     print_board(out, state.firmware.as_deref(), &channels, &state.faders)?;
-    writeln!(
-        out,
-        "Changes applied since the last dump: {}",
-        state.notifications
-    )?;
+    if state.refreshing {
+        writeln!(out, "(Previous state: the board is being read again.)")?;
+    } else {
+        writeln!(
+            out,
+            "Changes applied since the last dump: {}",
+            state.notifications
+        )?;
+    }
     Ok(())
 }
 

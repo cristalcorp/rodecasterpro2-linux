@@ -10,9 +10,9 @@ use ratatui::widgets::{
 use rcp2_audio::{Channel, PersistState};
 use rcp2_proto::InputSource;
 
-use super::app::{App, BoardIssue, Focus, Level};
+use super::app::{App, BoardShown, Focus, Level};
 use crate::daemon::{ChannelDto, StateDto};
-use crate::{BOARD_BEING_READ, BOARD_NOT_CONNECTED, channel_of, mute_label, output_label};
+use crate::{channel_of, mute_label, output_label};
 
 /// Golden yellow accent.
 const ACCENT: Color = Color::Rgb(255, 191, 0);
@@ -183,7 +183,8 @@ enum BoardPanel<'a> {
     State {
         /// Strips worth showing (empty ones hidden, unreadable ones kept).
         strips: Vec<Strip<'a>>,
-        /// The last complete state, shown while the service reads the board again.
+        /// Possibly no longer current: the board is read again, or the
+        /// service did not answer the last poll.
         refreshing: bool,
     },
     Message(String),
@@ -191,36 +192,28 @@ enum BoardPanel<'a> {
 
 impl<'a> BoardPanel<'a> {
     fn new(app: &'a App) -> Self {
-        let shown = |state: &'a StateDto, refreshing| Self::State {
-            strips: strips(state),
-            refreshing,
-        };
         match &app.board {
-            None => Self::Message("Asking the board service…".to_owned()),
-            Some(Err(BoardIssue::NotRunning)) => Self::Message(
-                "Board service not running: `rcp2ctl hid setup` installs it.".to_owned(),
-            ),
-            Some(Err(BoardIssue::Version(reason))) => Self::Message(service_message(reason)),
-            // A failed poll or two: `set_board` keeps the last state meanwhile.
-            Some(Err(BoardIssue::Other(reason))) => app.last_known.as_ref().map_or_else(
-                || Self::Message(service_message(reason)),
-                |last| shown(last, true),
-            ),
-            Some(Ok(state)) if state.connected && state.state_known => shown(state, false),
-            Some(Ok(state)) if state.connected => app.last_known.as_ref().map_or_else(
-                || Self::Message(BOARD_BEING_READ.to_owned()),
-                |last| shown(last, true),
-            ),
-            Some(Ok(_)) => Self::Message(BOARD_NOT_CONNECTED.to_owned()),
+            BoardShown::State { state, refreshing } => {
+                let strips = strips(state);
+                if strips.is_empty() {
+                    Self::Message("No channel is assigned on the board.".to_owned())
+                } else {
+                    Self::State {
+                        strips,
+                        refreshing: *refreshing,
+                    }
+                }
+            }
+            BoardShown::Message(text) => Self::Message(text.clone()),
         }
     }
 
     /// Fewest rows worth drawing: borders, and the header with one strip,
     /// or the one line of a message.
-    fn min_height(&self) -> u16 {
+    const fn min_height(&self) -> u16 {
         match self {
-            Self::State { strips, .. } if !strips.is_empty() => 4,
-            _ => 3,
+            Self::State { .. } => 4,
+            Self::Message(_) => 3,
         }
     }
 
@@ -246,14 +239,6 @@ impl<'a> BoardPanel<'a> {
             Self::Message(_) => None,
         }
     }
-}
-
-/// A service error as a sentence about the service, said once.
-fn service_message(reason: &str) -> String {
-    reason.strip_prefix("the board service").map_or_else(
-        || format!("Board service: {reason}"),
-        |rest| format!("Board service{rest}"),
-    )
 }
 
 fn strips(state: &StateDto) -> Vec<Strip<'_>> {
@@ -455,6 +440,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use rcp2_audio::{Channel, Graph, PersistState};
+    use std::time::{Duration, Instant};
 
     const DUMP: &str = include_str!("../../../rcp2-audio/tests/fixtures/pw-dump.json");
 
@@ -499,6 +485,12 @@ mod tests {
         assert!(screen.contains("PipeWire ALSA [qbz]"), "{screen}");
     }
 
+    /// Records an answer one second after the previous one.
+    fn answer(app: &mut App, view: crate::tui::app::BoardView, at: &mut Instant) {
+        *at += Duration::from_secs(1);
+        app.set_board(view, *at);
+    }
+
     fn board_state(known: bool) -> crate::daemon::StateDto {
         use crate::daemon::{ChannelDto, StateDto};
         let strip = |index, source: &str, code, muted| ChannelDto {
@@ -510,8 +502,8 @@ mod tests {
         StateDto {
             version: crate::daemon::PROTOCOL_VERSION,
             connected: true,
-            session: 1,
             state_known: known,
+            refreshing: false,
             firmware: Some("1.7.6".to_owned()),
             channels: if known {
                 vec![
@@ -547,7 +539,7 @@ mod tests {
     #[test]
     fn shows_the_board_and_the_fader_of_each_output() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.set_board(Ok(board_state(true)));
+        app.set_board(Ok(board_state(true)), Instant::now());
         let screen = screen(&app);
         assert!(screen.contains("3 RØDE Game   ♪1 ★ F5"), "{screen}");
         assert!(screen.contains("F1"), "{screen}");
@@ -562,10 +554,11 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_last_state_while_the_board_is_read_again() {
+    fn marks_the_previous_state_while_the_board_is_read_again() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.set_board(Ok(board_state(true)));
-        app.set_board(Ok(board_state(false)));
+        let mut refreshing = board_state(true);
+        refreshing.refreshing = true;
+        answer(&mut app, Ok(refreshing), &mut Instant::now());
         let screen = screen(&app);
         assert!(screen.contains("Console (refreshing…)"), "{screen}");
         assert!(screen.contains("F5"), "{screen}");
@@ -574,21 +567,28 @@ mod tests {
     #[test]
     fn explains_why_the_board_state_is_missing() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.set_board(Err(BoardIssue::NotRunning));
+        let at = &mut Instant::now();
+        answer(&mut app, Err(BoardIssue::NotRunning), at);
         assert!(screen(&app).contains("rcp2ctl hid setup"));
-        app.set_board(Err(BoardIssue::Other("socket timed out".to_owned())));
+        answer(
+            &mut app,
+            Err(BoardIssue::Other("socket timed out".to_owned())),
+            at,
+        );
         let screen = screen(&app);
         assert!(
             screen.contains("Board service: socket timed out"),
             "{screen}"
         );
         assert!(!screen.contains("hid setup"), "{screen}");
+        answer(&mut app, Ok(board_state(false)), at);
+        assert!(screen_of_height(&app, 24).contains(crate::BOARD_BEING_READ));
     }
 
     #[test]
     fn a_short_terminal_keeps_the_message_and_keys_lines() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.set_board(Ok(board_state(true)));
+        app.set_board(Ok(board_state(true)), Instant::now());
         app.message = Some((crate::tui::app::Level::Info, "hello there".to_owned()));
         let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
         let mode = Mode {
@@ -627,10 +627,11 @@ mod tests {
     #[test]
     fn says_when_the_board_is_unplugged() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.set_board(Ok(board_state(true)));
+        let at = &mut Instant::now();
+        answer(&mut app, Ok(board_state(true)), at);
         let mut unplugged = board_state(false);
         unplugged.connected = false;
-        app.set_board(Ok(unplugged));
+        answer(&mut app, Ok(unplugged), at);
         let screen = screen(&app);
         assert!(screen.contains(crate::BOARD_NOT_CONNECTED), "{screen}");
         assert!(!screen.contains('{'), "{screen}");
@@ -638,53 +639,52 @@ mod tests {
     }
 
     #[test]
-    fn a_new_session_drops_the_last_state() {
+    fn a_failed_poll_keeps_the_last_state_for_a_moment() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.set_board(Ok(board_state(true)));
-        // Unplugged and plugged back between two polls.
-        let mut replugged = board_state(false);
-        replugged.session = 2;
-        app.set_board(Ok(replugged));
-        let screen = screen(&app);
-        assert!(screen.contains(crate::BOARD_BEING_READ), "{screen}");
-        assert!(!screen.contains("F5"), "{screen}");
-    }
-
-    #[test]
-    fn a_few_failed_polls_keep_the_last_state() {
-        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.set_board(Ok(board_state(true)));
+        let start = Instant::now();
+        app.set_board(Ok(board_state(true)), start);
         let busy = || Err(BoardIssue::Other("socket timed out".to_owned()));
-        for _ in 0..3 {
-            app.set_board(busy());
-            let screen = screen(&app);
-            assert!(screen.contains("Console (refreshing…)"), "{screen}");
-            assert!(screen.contains("F5"), "{screen}");
-        }
-        app.set_board(busy());
-        let screen = screen(&app);
+        // Polls slowed down by the service: time counts, not polls.
+        app.set_board(busy(), start + Duration::from_secs(2));
+        let screen_now = screen(&app);
+        assert!(screen_now.contains("Console (refreshing…)"), "{screen_now}");
+        assert!(screen_now.contains("F5"), "{screen_now}");
+        app.set_board(busy(), start + Duration::from_secs(3));
+        let screen_now = screen(&app);
         assert!(
-            screen.contains("Board service: socket timed out"),
-            "{screen}"
+            screen_now.contains("Board service: socket timed out"),
+            "{screen_now}"
         );
-        // An answer resets the count.
-        app.set_board(Ok(board_state(true)));
-        app.set_board(busy());
-        assert!(screen_of_height(&app, 24).contains("F5"));
+        // A later answer shows the state again, as current.
+        app.set_board(Ok(board_state(true)), start + Duration::from_secs(4));
+        let screen_now = screen(&app);
+        assert!(!screen_now.contains("refreshing"), "{screen_now}");
+        assert!(screen_now.contains("F5"), "{screen_now}");
     }
 
     #[test]
     fn another_protocol_version_is_said_at_once() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.set_board(Ok(board_state(true)));
-        let reason = crate::daemon::DaemonError::ServiceOlder.to_string();
-        app.set_board(Err(BoardIssue::Version(reason.clone())));
+        let at = &mut Instant::now();
+        answer(&mut app, Ok(board_state(true)), at);
+        let reason = "older than this rcp2ctl".to_owned();
+        answer(&mut app, Err(BoardIssue::Version(reason)), at);
         let screen = screen(&app);
         assert!(
-            screen.contains("Board service is older than this rcp2ctl"),
+            screen.contains("Board service: older than this rcp2ctl"),
             "{screen}"
         );
         assert!(!screen.contains("F5"), "{screen}");
+    }
+
+    #[test]
+    fn a_board_without_channels_says_so() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        let mut bare = board_state(true);
+        bare.channels.clear();
+        answer(&mut app, Ok(bare), &mut Instant::now());
+        let screen = screen(&app);
+        assert!(screen.contains("No channel is assigned"), "{screen}");
     }
 
     #[test]
@@ -692,7 +692,7 @@ mod tests {
         let rows = u16::try_from(Channel::ALL.len()).unwrap() + 2;
         assert_eq!(MIN_BODY, rows);
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.set_board(Ok(board_state(true)));
+        app.set_board(Ok(board_state(true)), Instant::now());
         // The console wants 10 rows here; the body keeps its 8.
         let screen = screen_of_height(&app, 20);
         assert!(screen.contains("6 RØDE B"), "{screen}");
@@ -702,7 +702,7 @@ mod tests {
     #[test]
     fn a_tiny_terminal_leaves_the_console_out() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.set_board(Ok(board_state(true)));
+        app.set_board(Ok(board_state(true)), Instant::now());
         app.message = Some((crate::tui::app::Level::Info, "hello there".to_owned()));
         let screen = screen_of_height(&app, 12);
         assert!(screen.contains("hello there"), "{screen}");
@@ -714,23 +714,9 @@ mod tests {
     #[test]
     fn a_console_without_room_for_one_strip_is_left_out() {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.set_board(Ok(board_state(true)));
+        app.set_board(Ok(board_state(true)), Instant::now());
         // 3 rows free: borders and header, no strip.
         assert!(!screen_of_height(&app, 14).contains("Console"));
         assert!(screen_of_height(&app, 15).contains("Mic 1"));
-    }
-
-    #[test]
-    fn a_dump_that_never_comes_drops_the_last_state() {
-        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
-        app.set_board(Ok(board_state(true)));
-        for _ in 0..10 {
-            app.set_board(Ok(board_state(false)));
-        }
-        assert!(screen(&app).contains("Console (refreshing…)"));
-        app.set_board(Ok(board_state(false)));
-        let screen = screen(&app);
-        assert!(screen.contains(crate::BOARD_BEING_READ), "{screen}");
-        assert!(!screen.contains("F5"), "{screen}");
     }
 }

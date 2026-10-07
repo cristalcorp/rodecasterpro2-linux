@@ -4,7 +4,7 @@ mod app;
 mod view;
 
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,11 +28,18 @@ type Snapshot = (Instant, Result<Graph, PwError>);
 /// Asks the board service for the board state.
 fn board_view() -> BoardView {
     use crate::daemon::DaemonError;
+    // Worded to follow "Board service: ".
     crate::daemon::query_state().map_err(|err| match err {
         DaemonError::NotRunning => BoardIssue::NotRunning,
-        DaemonError::ServiceOlder | DaemonError::ServiceNewer => {
-            BoardIssue::Version(err.to_string())
-        }
+        DaemonError::ServiceOlder => BoardIssue::Version(
+            "older than this rcp2ctl: restart it with this one \
+             (`rcp2ctl hid setup` does it for the systemd service)"
+                .to_owned(),
+        ),
+        DaemonError::ServiceNewer => BoardIssue::Version(
+            "newer than this rcp2ctl: use the rcp2ctl it was installed with".to_owned(),
+        ),
+        DaemonError::BadAnswer(reason) => BoardIssue::Other(format!("invalid answer: {reason}")),
         err => BoardIssue::Other(err.to_string()),
     })
 }
@@ -118,8 +125,17 @@ fn event_loop(
     loop {
         terminal.draw(|frame| view::render(frame, app, mode))?;
 
-        while let Ok(board) = boards.try_recv() {
-            app.set_board(board);
+        loop {
+            match boards.try_recv() {
+                Ok(board) => app.set_board(board, Instant::now()),
+                Err(TryRecvError::Empty) => break,
+                // Its thread is gone: say so rather than show a frozen state.
+                Err(TryRecvError::Disconnected) => {
+                    let issue = BoardIssue::Other("no longer asked (watcher stopped)".to_owned());
+                    app.set_board(Err(issue), Instant::now());
+                    break;
+                }
+            }
         }
         while let Ok((started, refresh)) = snapshots.try_recv() {
             if started < fresh_after {

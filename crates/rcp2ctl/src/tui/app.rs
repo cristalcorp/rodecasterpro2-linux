@@ -1,9 +1,12 @@
 //! TUI state and key handling: pure, no I/O, so it is tested without a terminal.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::time::{Duration, Instant};
+
 use rcp2_audio::{Channel, Graph};
 
 use crate::daemon::StateDto;
+use crate::{BOARD_BEING_READ, BOARD_NOT_CONNECTED};
 
 /// Which panel receives the arrow keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,26 +49,18 @@ pub(crate) struct App {
     pub(crate) output_selected: usize,
     pub(crate) message: Option<(Level, String)>,
     pub(crate) show_help: bool,
-    /// The board's own state from the board service, or why it is missing.
-    pub(crate) board: Option<BoardView>,
-    /// The last complete state, shown (as refreshing) while the service
-    /// reads the board again, so the screen does not jump.
-    pub(crate) last_known: Option<StateDto>,
-    /// Failed polls in a row since the last answer from the service.
-    failed_polls: u8,
-    /// Polls in a row where the board was being read again.
-    reading_polls: u8,
+    /// What the Console panel shows.
+    pub(crate) board: BoardShown,
+    /// When the board service last answered, for the grace given to a
+    /// failed poll.
+    last_answer: Option<Instant>,
 }
 
-/// Failed polls in a row (one a second) still shown as the last state:
-/// a busy service is not worth a flicker, a lasting failure is worth saying.
-const TOLERATED_FAILURES: u8 = 3;
-/// Polls in a row (one a second) the last state is shown while the board is
-/// read again: a dump takes a moment, but one that never comes must not
-/// leave old mutes and levels on screen.
-const TOLERATED_READING: u8 = 10;
+/// How long a failed poll still shows the last state: a busy service is
+/// not worth a flicker, a lasting failure is worth saying.
+const FAILURE_GRACE: Duration = Duration::from_secs(3);
 
-/// Why the board state is unavailable.
+/// Why the board service could not be asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BoardIssue {
     /// No board service answers.
@@ -79,6 +74,17 @@ pub(crate) enum BoardIssue {
 /// What the board service said: its state, or why it could not be asked.
 pub(crate) type BoardView = Result<StateDto, BoardIssue>;
 
+/// What the Console panel shows, decided when an answer arrives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoardShown {
+    /// The board's state; `refreshing` when it may no longer be current.
+    State {
+        state: StateDto,
+        refreshing: bool,
+    },
+    Message(String),
+}
+
 impl App {
     pub(crate) fn new(graph: Graph) -> Self {
         Self {
@@ -88,43 +94,45 @@ impl App {
             output_selected: 0,
             message: None,
             show_help: false,
-            board: None,
-            last_known: None,
-            failed_polls: 0,
-            reading_polls: 0,
+            board: BoardShown::Message("Asking the board service…".to_owned()),
+            last_answer: None,
         }
     }
 
-    /// Records the board service's answer, keeping the last complete state
-    /// for as long as the same board session lasts, and through a few
-    /// failed polls.
-    pub(crate) fn set_board(&mut self, view: BoardView) {
-        let count =
-            |polls: &mut u8, now: bool| *polls = if now { polls.saturating_add(1) } else { 0 };
-        count(
-            &mut self.failed_polls,
-            matches!(view, Err(BoardIssue::Other(_))),
-        );
-        count(
-            &mut self.reading_polls,
-            matches!(&view, Ok(state) if state.connected && !state.state_known),
-        );
-        match &view {
-            Ok(state) if state.connected && state.state_known => {
-                self.last_known = Some(state.clone());
+    /// Records the board service's answer at `now`. A failed poll keeps the
+    /// last state for a moment, marked refreshing.
+    pub(crate) fn set_board(&mut self, view: BoardView, now: Instant) {
+        self.board = match view {
+            Ok(state) => {
+                self.last_answer = Some(now);
+                if !state.connected {
+                    BoardShown::Message(BOARD_NOT_CONNECTED.to_owned())
+                } else if !state.state_known {
+                    BoardShown::Message(BOARD_BEING_READ.to_owned())
+                } else {
+                    let refreshing = state.refreshing;
+                    BoardShown::State { state, refreshing }
+                }
             }
-            // Same session, being read again: the last state still holds.
-            Ok(state)
-                if state.connected
-                    && self.reading_polls <= TOLERATED_READING
-                    && self
-                        .last_known
-                        .as_ref()
-                        .is_some_and(|last| last.session == state.session) => {}
-            Err(BoardIssue::Other(_)) if self.failed_polls <= TOLERATED_FAILURES => {}
-            _ => self.last_known = None,
-        }
-        self.board = Some(view);
+            Err(BoardIssue::Other(reason)) => {
+                let recent = self
+                    .last_answer
+                    .is_some_and(|last| now.saturating_duration_since(last) < FAILURE_GRACE);
+                match &mut self.board {
+                    BoardShown::State { refreshing, .. } if recent => {
+                        *refreshing = true;
+                        return;
+                    }
+                    _ => BoardShown::Message(format!("Board service: {reason}")),
+                }
+            }
+            Err(BoardIssue::Version(reason)) => {
+                BoardShown::Message(format!("Board service: {reason}"))
+            }
+            Err(BoardIssue::NotRunning) => BoardShown::Message(
+                "Board service not running: `rcp2ctl hid setup` installs it.".to_owned(),
+            ),
+        };
     }
 
     /// Replaces the graph, keeping the selection on the same stream when it

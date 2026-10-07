@@ -31,8 +31,11 @@ const MAX_REQUEST: u64 = 256;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Version of the socket protocol.
 /// 2: channels carry their source code, fader levels may be unreadable.
-/// 3: each board session has its own number.
+/// 3: the previous state is kept, marked refreshing, while a new dump is read.
 pub(crate) const PROTOCOL_VERSION: u32 = 3;
+/// How long the previous state is still served while a new dump is awaited:
+/// a dump takes a moment, one that never comes must not leave old values.
+const STALE_FOR: Duration = Duration::from_secs(15);
 /// Least time between two requests for a new dump.
 const RESYNC_EVERY: Duration = Duration::from_secs(5);
 /// Notifications kept while waiting for a dump; beyond that, a new dump is
@@ -87,7 +90,6 @@ pub(crate) struct ChannelDto {
     /// Human-readable source.
     pub(crate) source: String,
     /// The board's source code (`channelInputSource`), if readable.
-    #[serde(default)]
     pub(crate) code: Option<i32>,
     /// Output muted, if reported.
     pub(crate) muted: Option<bool>,
@@ -99,12 +101,11 @@ pub(crate) struct StateDto {
     pub(crate) version: u32,
     /// A session with the board is open.
     pub(crate) connected: bool,
-    /// Number of the board session, new after every unplug: a state from
-    /// another session no longer describes the board.
-    #[serde(default)]
-    pub(crate) session: u64,
-    /// The board's state is known (false while the first or a new dump is read).
+    /// The board's state is known (false while the first dump is read, and
+    /// when a new one takes too long).
     pub(crate) state_known: bool,
+    /// The state is the previous one: a new dump is being read.
+    pub(crate) refreshing: bool,
     pub(crate) firmware: Option<String>,
     pub(crate) channels: Vec<ChannelDto>,
     /// One entry per fader; `None` if its level is unreadable.
@@ -114,19 +115,22 @@ pub(crate) struct StateDto {
 }
 
 impl StateDto {
-    fn new(shared: &Shared) -> Self {
+    fn new(shared: &Shared, now: Instant) -> Self {
         let Shared {
             connected,
-            session,
             ref tree,
+            refreshing_since,
             notifications,
         } = *shared;
-        let state = tree.as_ref().map(BoardState::from_tree).unwrap_or_default();
+        let tree = tree.as_ref().filter(|_| {
+            refreshing_since.is_none_or(|since| now.saturating_duration_since(since) < STALE_FOR)
+        });
+        let state = tree.map(BoardState::from_tree).unwrap_or_default();
         Self {
             version: PROTOCOL_VERSION,
             connected,
-            session,
             state_known: tree.is_some(),
+            refreshing: tree.is_some() && refreshing_since.is_some(),
             firmware: state.firmware,
             channels: state
                 .channels
@@ -148,9 +152,10 @@ impl StateDto {
 #[derive(Default)]
 struct Shared {
     connected: bool,
-    /// Incremented each time a session opens; kept across sessions.
-    session: u64,
+    /// The last complete state, kept while a new dump is read.
     tree: Option<Node>,
+    /// When a new dump was asked for, until it is complete.
+    refreshing_since: Option<Instant>,
     notifications: u64,
 }
 
@@ -193,11 +198,7 @@ pub(crate) fn run(log: &mut impl Write) -> Result<(), DaemonError> {
                 let _ = writeln!(log, "board found at {}: opening a session", path.display());
                 let reason = session(board, &shared, log);
                 let _ = writeln!(log, "session ended: {reason}");
-                let mut state = lock(&shared);
-                *state = Shared {
-                    session: state.session,
-                    ..Shared::default()
-                };
+                *lock(&shared) = Shared::default();
             }
             Err(rcp2_hid::HidError::NotFound) => {}
             Err(err) => {
@@ -234,14 +235,10 @@ fn session(mut board: rcp2_hid::Board, shared: &SharedState, log: &mut impl Writ
         Err(err) => return err.to_string(),
     };
     let mut sync = Tracker::default();
-    if let Err(err) = sync.request(&mut board) {
+    if let Err(err) = sync.request(&mut board, shared) {
         return err.to_string();
     }
-    {
-        let mut state = lock(shared);
-        state.connected = true;
-        state.session = state.session.wrapping_add(1);
-    }
+    lock(shared).connected = true;
     loop {
         let report = match reports.recv_timeout(RESYNC_EVERY) {
             Ok(Ok(report)) => Some(report),
@@ -252,15 +249,14 @@ fn session(mut board: rcp2_hid::Board, shared: &SharedState, log: &mut impl Writ
         let needs_resync = match report {
             Some(report) => sync.handle(&report.bytes, shared),
             // Quiet board: only a problem if a dump was asked for and never came.
-            None => lock(shared).tree.is_none(),
+            None => lock(shared).refreshing_since.is_some(),
         };
         if needs_resync && sync.may_request() {
             let _ = writeln!(
                 log,
                 "state copy out of date: asking the board for a new dump"
             );
-            lock(shared).tree = None;
-            if let Err(err) = sync.request(&mut board) {
+            if let Err(err) = sync.request(&mut board, shared) {
                 return err.to_string();
             }
         }
@@ -271,17 +267,24 @@ fn session(mut board: rcp2_hid::Board, shared: &SharedState, log: &mut impl Writ
 #[derive(Default)]
 struct Tracker {
     assembler: DumpAssembler,
-    /// Property changes received while no complete dump is available.
+    /// Property changes received while a dump is awaited, for the new tree.
     pending: Vec<Change>,
     last_request: Option<Instant>,
 }
 
 impl Tracker {
-    /// Asks for a full dump (the handshake), forgetting partial data.
-    fn request(&mut self, board: &mut rcp2_hid::Board) -> Result<(), rcp2_hid::HidError> {
+    /// Asks for a full dump (the handshake), forgetting partial data; the
+    /// current tree is still served, as refreshing, until the dump is in.
+    fn request(
+        &mut self,
+        board: &mut rcp2_hid::Board,
+        shared: &SharedState,
+    ) -> Result<(), rcp2_hid::HidError> {
         self.assembler = DumpAssembler::default();
         self.pending.clear();
-        self.last_request = Some(Instant::now());
+        let now = Instant::now();
+        self.last_request = Some(now);
+        lock(shared).refreshing_since.get_or_insert(now);
         board.handshake()
     }
 
@@ -307,6 +310,7 @@ impl Tracker {
                     }
                     let mut state = lock(shared);
                     state.tree = Some(tree);
+                    state.refreshing_since = None;
                     state.notifications = applied;
                     !fits
                 }
@@ -319,8 +323,11 @@ impl Tracker {
             },
             Incoming::Change(change) => {
                 let mut state = lock(shared);
+                let awaited = state.refreshing_since.is_some();
                 match state.tree.as_mut() {
-                    Some(tree) if self.assembler.missing().is_none() => {
+                    // The tree being replaced is out of date: keep the change
+                    // for the new one.
+                    Some(tree) if !awaited && self.assembler.missing().is_none() => {
                         if apply(tree, change) {
                             state.notifications += 1;
                             false
@@ -391,7 +398,7 @@ fn answer(stream: UnixStream, shared: &SharedState) -> io::Result<()> {
     if request.trim() != "state" {
         return writeln!(stream, "{{\"error\":\"unknown request\"}}");
     }
-    let answer = StateDto::new(&lock(shared));
+    let answer = StateDto::new(&lock(shared), Instant::now());
     let json = serde_json::to_string(&answer).map_err(io::Error::other)?;
     writeln!(stream, "{json}")
 }
@@ -445,9 +452,11 @@ fn parse_answer(line: &str) -> Result<StateDto, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonError, PROTOCOL_VERSION, Shared, StateDto, apply, check_version, parse_answer,
+        DaemonError, PROTOCOL_VERSION, STALE_FOR, Shared, StateDto, apply, check_version,
+        parse_answer,
     };
     use rcp2_proto::{Change, Node, Var};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn shape_changes_always_need_a_new_dump() {
@@ -472,13 +481,15 @@ mod tests {
 
     #[test]
     fn a_session_without_a_tree_is_connected_but_unknown() {
-        let state = StateDto::new(&Shared {
-            connected: true,
-            session: 4,
-            ..Shared::default()
-        });
+        let state = StateDto::new(
+            &Shared {
+                connected: true,
+                ..Shared::default()
+            },
+            Instant::now(),
+        );
         assert!(state.connected);
-        assert_eq!(state.session, 4);
+        assert!(!state.refreshing);
         assert!(!state.state_known);
         assert!(state.channels.is_empty());
         let json = serde_json::to_string(&state).unwrap();
@@ -512,5 +523,32 @@ mod tests {
             parse_answer("not json"),
             Err(DaemonError::BadAnswer(_))
         ));
+    }
+
+    #[test]
+    fn the_previous_state_is_served_while_a_new_dump_is_read() {
+        let asked = Instant::now();
+        let shared = Shared {
+            connected: true,
+            tree: Some(Node::default()),
+            refreshing_since: Some(asked),
+            notifications: 0,
+        };
+        let soon = StateDto::new(&shared, asked + Duration::from_secs(1));
+        assert!(soon.state_known);
+        assert!(soon.refreshing);
+        // A dump that never comes: the old state is no longer served.
+        let late = StateDto::new(&shared, asked + STALE_FOR);
+        assert!(!late.state_known);
+        assert!(!late.refreshing);
+        let done = StateDto::new(
+            &Shared {
+                refreshing_since: None,
+                ..shared
+            },
+            asked + STALE_FOR,
+        );
+        assert!(done.state_known);
+        assert!(!done.refreshing);
     }
 }
