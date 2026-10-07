@@ -27,6 +27,10 @@ const BUSY_POLLS: u128 = 6;
 /// No answer in time: each such poll lasts up to `QUERY_TIMEOUT`, so a
 /// frozen service is said after two.
 const TIMED_OUT_POLLS: u128 = 2;
+/// Polls in a row without a read board through which the last one is still
+/// shown, whatever the answers (T8): a service that keeps crashing, or keeps
+/// starting, is said in the end.
+const UNREAD_POLLS: u128 = 20;
 
 const NO_CHANNEL: &str = "No channel is assigned on the board.";
 const ASKING: &str = "Asking the board service…";
@@ -138,10 +142,12 @@ pub(crate) struct Console {
     /// The last answer, while it still stands for the board: forgotten once
     /// a failure is said, so a later passing one cannot bring it back.
     last: Option<StateDto>,
-    /// Polls failed in a row since the last answer.
-    failed: u128,
-    /// Of those, polls that ran out of time.
+    /// Polls failed in a row since the last answer, by kind of failure.
+    busy: u128,
+    gone: u128,
     timed_out: u128,
+    /// Polls in a row since the last answer with a read board.
+    unread: u128,
     shown: BoardShown,
 }
 
@@ -149,8 +155,10 @@ impl Console {
     pub(crate) fn new() -> Self {
         Self {
             last: None,
-            failed: 0,
+            busy: 0,
+            gone: 0,
             timed_out: 0,
+            unread: 0,
             shown: BoardShown::Message(ASKING.to_owned()),
         }
     }
@@ -162,15 +170,25 @@ impl Console {
     /// Records what a poll brought, and decides the panel (table T of
     /// `05-Etats-et-flux`): a passing failure keeps the last answer for a
     /// few polls, marked refreshing, and so does a service that says it is
-    /// starting; anything else is said at once.
+    /// starting, up to a bound on polls without a read board; anything else
+    /// is said at once.
     pub(crate) fn record(&mut self, view: BoardView) {
+        self.unread = self.unread.saturating_add(1);
+        // T8.
+        let unread_passing = self.unread <= UNREAD_POLLS;
         let issue = match view {
             Ok(state) => {
-                self.failed = 0;
+                self.busy = 0;
+                self.gone = 0;
                 self.timed_out = 0;
+                if read(&state) {
+                    self.unread = 0;
+                }
                 // T5: a restarted service still taking its first look at the
-                // board; it bounds that time itself.
+                // board; it bounds that time itself, T8 a service that keeps
+                // restarting.
                 if state.starting
+                    && unread_passing
                     && !read(&state)
                     && let Some(last) = self.last.as_ref().filter(|last| read(last))
                 {
@@ -184,21 +202,22 @@ impl Console {
             }
             Err(issue) => issue,
         };
-        self.failed = self.failed.saturating_add(1);
-        let limit = match issue.patience {
-            Patience::None => 0,
-            Patience::Busy => BUSY_POLLS,
-            Patience::Gone => RESTART_POLLS,
-            Patience::TimedOut => {
-                self.timed_out = self.timed_out.saturating_add(1);
-                BUSY_POLLS
-            }
+        // T9: each kind of failure against its own limit.
+        let counted = match issue.patience {
+            Patience::None => None,
+            Patience::Busy => Some((&mut self.busy, BUSY_POLLS)),
+            Patience::Gone => Some((&mut self.gone, RESTART_POLLS)),
+            Patience::TimedOut => Some((&mut self.timed_out, TIMED_OUT_POLLS)),
         };
-        let passing = self.failed <= limit && self.timed_out <= TIMED_OUT_POLLS;
+        let within = counted.is_some_and(|(count, limit)| {
+            *count = count.saturating_add(1);
+            *count <= limit
+        });
+        let passing = within && unread_passing;
         self.shown = match &self.last {
             // T2, T3, T4.
             Some(state) if passing => from_state(state, true),
-            // T7, and any failure past its limit.
+            // T7, T8, and any failure past its limit.
             _ => {
                 self.last = None;
                 BoardShown::Message(issue.text)
@@ -247,6 +266,7 @@ fn from_state(state: &StateDto, unanswered: bool) -> BoardShown {
 pub(crate) mod tests {
     use super::{
         BUSY_POLLS, BoardIssue, BoardShown, Console, Patience, RESTART_POLLS, TIMED_OUT_POLLS,
+        UNREAD_POLLS,
     };
     use crate::daemon::{ChannelDto, DaemonError, PROTOCOL_VERSION, StateDto};
     use rcp2_audio::Channel;
@@ -426,8 +446,9 @@ pub(crate) mod tests {
     fn t5_a_restarted_service_starting_keeps_the_last_state() {
         let mut console = read_console();
         console.record(failed(&DaemonError::NotRunning));
-        // Searching the board, then reading it: as long as it says so.
-        for _ in 0..10 {
+        // Searching the board, then reading it: as long as it says so, within
+        // T8's bound.
+        for _ in 0..(UNREAD_POLLS - 1) / 2 {
             console.record(Ok(starting(false)));
             console.record(Ok(starting(true)));
         }
@@ -468,6 +489,67 @@ pub(crate) mod tests {
         let mut console = read_console();
         console.record(Ok(unplugged()));
         assert_eq!(text(&console), crate::BOARD_NOT_CONNECTED);
+    }
+
+    #[test]
+    fn t8_a_service_that_keeps_crashing_is_said_in_the_end() {
+        // Crashes, restarts, starts, crashes again: each answer alone would
+        // keep the last state.
+        let crash_loop = || {
+            [
+                failed(&DaemonError::Dropped),
+                failed(&DaemonError::NotRunning),
+                Ok(starting(true)),
+                Ok(starting(true)),
+            ]
+            .into_iter()
+            .cycle()
+        };
+        let mut console = read_console();
+        let mut polls = crash_loop();
+        for poll in polls.by_ref().take(usize::try_from(UNREAD_POLLS).unwrap()) {
+            console.record(poll);
+            assert_eq!(refreshing(&console), Some(true));
+        }
+        console.record(polls.next().unwrap());
+        assert_eq!(refreshing(&console), None);
+        // Restarted between every two polls: only ever starting.
+        let mut console = read_console();
+        for _ in 0..UNREAD_POLLS {
+            console.record(Ok(starting(true)));
+            assert_eq!(refreshing(&console), Some(true));
+        }
+        console.record(Ok(starting(true)));
+        assert_eq!(text(&console), crate::BOARD_BEING_READ);
+        // Only a read board starts the count again.
+        let mut console = read_console();
+        for poll in crash_loop().take(usize::try_from(UNREAD_POLLS).unwrap() - 1) {
+            console.record(poll);
+        }
+        console.record(Ok(board_state(true)));
+        for poll in crash_loop().take(usize::try_from(UNREAD_POLLS).unwrap()) {
+            console.record(poll);
+            assert_eq!(refreshing(&console), Some(true));
+        }
+    }
+
+    #[test]
+    fn t9_each_kind_of_failure_has_its_own_limit() {
+        // Busy up to its limit, then gone: the restart is still waited out.
+        let mut console = read_console();
+        assert!(kept_through(&mut console, &DaemonError::Busy, BUSY_POLLS));
+        assert!(kept_through(
+            &mut console,
+            &DaemonError::NotRunning,
+            RESTART_POLLS
+        ));
+        console.record(failed(&DaemonError::NotRunning));
+        assert!(text(&console).starts_with("The board service is not running"));
+        // An answer starts every count again.
+        let mut console = read_console();
+        assert!(kept_through(&mut console, &DaemonError::Busy, BUSY_POLLS));
+        console.record(Ok(starting(true)));
+        assert!(kept_through(&mut console, &DaemonError::Busy, BUSY_POLLS));
     }
 
     #[test]

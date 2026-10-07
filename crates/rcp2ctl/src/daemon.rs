@@ -241,12 +241,10 @@ pub(crate) fn run(log: &mut impl Write) -> Result<(), DaemonError> {
                 let _ = writeln!(log, "board found at {}: opening a session", path.display());
                 let reason = session(board, &shared, log);
                 let _ = writeln!(log, "session ended: {reason}");
-                // Starting is over too.
-                *lock(&shared) = Shared::default();
+                session_ended(&shared);
             }
             Err(err) => {
-                // No board to read: the first look is over.
-                lock(&shared).starting_since = None;
+                board_absent(&shared);
                 if !matches!(err, rcp2_hid::HidError::NotFound) {
                     let _ = writeln!(log, "{err}");
                 }
@@ -256,12 +254,29 @@ pub(crate) fn run(log: &mut impl Write) -> Result<(), DaemonError> {
     }
 }
 
+/// S1: no board to read, the first look is over.
+fn board_absent(shared: &SharedState) {
+    lock(shared).starting_since = None;
+}
+
+/// S11: the session is over, and starting with it; a blank state until the
+/// board is found again.
+fn session_ended(shared: &SharedState) {
+    *lock(shared) = Shared::default();
+}
+
 /// Takes the instance lock, then binds the socket in a private directory,
 /// replacing one left by a killed instance. The lock (released by the
 /// kernel when the process ends, however it ends) is what tells a running
-/// instance, frozen or not, from a leftover socket.
+/// instance, frozen or not, from a leftover socket; a socket someone listens
+/// on is kept too, for an instance older than the lock.
 fn bind(path: &Path) -> Result<(fs::File, UnixListener), DaemonError> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("/"));
+    let dir = path.parent().ok_or_else(|| {
+        io_err(path)(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no directory to place the socket in",
+        ))
+    })?;
     fs::create_dir_all(dir).map_err(io_err(dir))?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_err(dir))?;
     let lock_path = dir.join(LOCK_NAME);
@@ -282,6 +297,12 @@ fn bind(path: &Path) -> Result<(fs::File, UnixListener), DaemonError> {
         // Not ours to remove.
         if !meta.file_type().is_socket() {
             return Err(DaemonError::AlreadyRunning(path.to_owned()));
+        }
+        // Listened on (a full backlog says so too): an instance without the
+        // lock.
+        match connect_now(path) {
+            Err(err) if err.kind() != io::ErrorKind::WouldBlock => {}
+            _ => return Err(DaemonError::AlreadyRunning(path.to_owned())),
         }
         match fs::remove_file(path) {
             Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(io_err(path)(err)),
@@ -412,14 +433,18 @@ impl Tracker {
                     self.need(shared, now);
                 }
             }
+            // A dump arriving, asked for or not (S13): the tree it replaces
+            // is out of date.
             Ok(None) => {
-                if self.progress.is_some() {
-                    self.progress = Some(now);
-                }
+                self.progress = Some(now);
+                lock(shared).refreshing_since.get_or_insert(now);
             }
             // A chunk that belongs to no dump: our view of the stream is off.
+            // The board is still sending (S14): asked again once it is
+            // quiet.
             Err(_) => {
                 self.assembler = DumpAssembler::default();
+                self.progress = Some(now);
                 self.need(shared, now);
             }
         }
@@ -683,7 +708,8 @@ mod tests {
     use super::{
         BUSY_ANSWER, CHUNK_SILENCE, DaemonError, MAX_PENDING, PROTOCOL_VERSION, QUERY_TIMEOUT,
         RESYNC_EVERY, STALE_FOR, Shared, SharedState, StateDto, Tracker, answer_err, apply, bind,
-        check_version, connect, exchange, lock, parse_answer, read_answer, turn_away,
+        board_absent, check_version, connect, exchange, lock, parse_answer, read_answer,
+        session_ended, turn_away,
     };
     use rcp2_proto::{Change, Node, Var};
     use std::io::Write as _;
@@ -1037,13 +1063,19 @@ mod tests {
             assert_eq!(served_level(&shared), Some(Var::Int(1)));
             assert!(sync.due(t0 + secs(6.0)));
         }
-        // A chunk that belongs to no dump.
+        // A chunk that belongs to no dump: asked again once the board is
+        // quiet (S14).
         let (mut sync, shared) = synced(t0);
-        let mut stray = vec![rcp2_proto::PROPERTY_IN_REPORT_ID];
-        stray.extend([0xFF; 255]);
-        sync.handle(&stray, &shared, t0 + secs(6.0));
+        sync.handle(&stray(), &shared, t0 + secs(6.0));
         assert!(refreshing(&shared, t0 + secs(6.0)));
-        assert!(sync.due(t0 + secs(6.0)));
+        assert!(sync.due(t0 + secs(6.0) + CHUNK_SILENCE));
+    }
+
+    /// A chunk that belongs to no dump.
+    fn stray() -> Vec<u8> {
+        let mut report = vec![rcp2_proto::PROPERTY_IN_REPORT_ID];
+        report.extend([0xFF; 255]);
+        report
     }
 
     #[test]
@@ -1155,6 +1187,75 @@ mod tests {
     }
 
     #[test]
+    fn s1_starting_is_over_once_the_board_is_not_found() {
+        let t0 = Instant::now();
+        let shared = SharedState::new(std::sync::Mutex::new(Shared {
+            starting_since: Some(t0),
+            ..Shared::default()
+        }));
+        board_absent(&shared);
+        let state = StateDto::new(&lock(&shared), t0);
+        assert!(!state.connected && !state.starting);
+    }
+
+    #[test]
+    fn s11_an_ended_session_serves_a_blank_state() {
+        let t0 = Instant::now();
+        let (_sync, shared) = synced(t0);
+        lock(&shared).starting_since = Some(t0);
+        session_ended(&shared);
+        let state = StateDto::new(&lock(&shared), t0 + secs(1.0));
+        assert!(!state.connected && !state.starting && !state.state_known);
+    }
+
+    #[test]
+    fn s13_a_dump_not_asked_for_is_read_as_one_asked_for() {
+        let t0 = Instant::now();
+        let (mut sync, shared) = synced(t0);
+        let reports = dump_reports(&board_tree());
+        let first = t0 + secs(10.0);
+        sync.handle(reports.first().unwrap(), &shared, first);
+        assert!(refreshing(&shared, first));
+        // S8: it stops, it is asked for.
+        assert!(!sync.due(first + just_before(CHUNK_SILENCE)));
+        assert!(sync.due(first + CHUNK_SILENCE));
+        // S7: changes lost while it arrives; asked again only once it is in.
+        let (mut sync, shared) = synced(t0);
+        let step = CHUNK_SILENCE.mul_f64(0.9);
+        let mut now = first;
+        for (position, report) in reports.iter().enumerate() {
+            if position == 1 {
+                for value in 0..=i32::try_from(MAX_PENDING).unwrap() {
+                    sync.change(level(value), &shared, now);
+                }
+            }
+            sync.handle(report, &shared, now);
+            now += step;
+            if position + 1 < reports.len() {
+                assert!(!sync.due(now), "asked again mid-transfer");
+            }
+        }
+        assert!(sync.due(now));
+    }
+
+    #[test]
+    fn s14_stray_chunks_mean_the_board_is_still_sending() {
+        let t0 = Instant::now();
+        let (mut sync, shared) = synced(t0);
+        let first = t0 + secs(10.0);
+        let step = CHUNK_SILENCE.mul_f64(0.9);
+        let mut now = first;
+        for _ in 0..3 {
+            sync.handle(&stray(), &shared, now);
+            assert!(refreshing(&shared, now));
+            assert!(!sync.due(now + just_before(CHUNK_SILENCE)));
+            now += step;
+        }
+        now -= step;
+        assert!(sync.due(now + CHUNK_SILENCE));
+    }
+
+    #[test]
     fn s10_s11_starting_and_refreshing_are_bounded() {
         let t0 = Instant::now();
         let shared = Shared {
@@ -1180,6 +1281,17 @@ mod tests {
         drop(first);
         assert!(path.exists());
         let _again = bind(&path).unwrap();
+        // An instance older than the lock: it holds none, but listens.
+        let old = scratch.0.join("old").join("board.sock");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        let _old_instance = std::os::unix::net::UnixListener::bind(&old).unwrap();
+        assert!(matches!(bind(&old), Err(DaemonError::AlreadyRunning(_))));
+        assert!(connect(&old).is_ok());
+        // No directory to place it in: refused, nothing made at the root.
+        assert!(matches!(
+            bind(Path::new("/")),
+            Err(DaemonError::Io { ref source, .. }) if source.kind() == std::io::ErrorKind::InvalidInput
+        ));
         // A file that is not a socket is not ours to remove.
         let other = scratch.0.join("other").join("board.sock");
         std::fs::create_dir_all(other.parent().unwrap()).unwrap();
