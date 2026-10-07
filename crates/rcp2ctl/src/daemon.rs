@@ -231,14 +231,22 @@ fn bind(path: &Path) -> Result<UnixListener, DaemonError> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_err(dir))?;
     }
     if let Ok(meta) = fs::symlink_metadata(path) {
-        // Refused: nobody listens. Anything else, a frozen instance included
-        // (its backlog full), is someone there.
-        let listened = !matches!(
-            connect_now(path),
-            Err(err) if err.kind() == io::ErrorKind::ConnectionRefused
-        );
-        if !meta.file_type().is_socket() || listened {
+        if !meta.file_type().is_socket() {
             return Err(DaemonError::AlreadyRunning(path.to_owned()));
+        }
+        match connect_now(path) {
+            // Someone listens, even frozen (its backlog full).
+            Ok(_) => return Err(DaemonError::AlreadyRunning(path.to_owned())),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                return Err(DaemonError::AlreadyRunning(path.to_owned()));
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                ) => {}
+            // Could not tell (out of files, path too long…): said, not guessed.
+            Err(err) => return Err(io_err(path)(err)),
         }
         // A socket nobody listens on: left over by a killed instance.
         fs::remove_file(path).map_err(io_err(path))?;
@@ -772,16 +780,37 @@ mod tests {
         assert!(matches!(answer, Err(DaemonError::Busy)), "{answer:?}");
     }
 
+    /// A directory of its own for a test, removed even if the test fails.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("rcp2ctl-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn connecting_never_waits_for_a_service_that_does_not_accept() {
-        let dir = std::env::temp_dir().join(format!("rcp2ctl-connect-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("board.sock");
+        let scratch = Scratch::new("connect");
+        let path = scratch.0.join("board.sock");
         assert!(matches!(connect(&path), Err(DaemonError::NotRunning)));
         // A frozen service: it listens but never accepts, so its backlog
-        // fills; each attempt then fails at once instead of waiting.
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // (one connection here) fills; then an attempt fails at once.
+        let listener =
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        listener
+            .bind(&socket2::SockAddr::unix(&path).unwrap())
+            .unwrap();
+        listener.listen(1).unwrap();
         let started = Instant::now();
         let mut held = Vec::new();
         let full = loop {
@@ -789,14 +818,12 @@ mod tests {
                 Ok(stream) => held.push(stream),
                 Err(err) => break err,
             }
-            assert!(held.len() < 10_000, "the backlog never filled");
+            assert!(held.len() < 16, "the backlog never filled");
         };
         assert!(matches!(full, DaemonError::NoAnswer), "{full:?}");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
         // Left behind by a killed service: nobody listens on it.
         drop(listener);
         assert!(matches!(connect(&path), Err(DaemonError::NotRunning)));
-        drop(held);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
