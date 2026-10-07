@@ -193,14 +193,14 @@ enum BoardPanel<'a> {
 impl<'a> BoardPanel<'a> {
     fn new(app: &'a App) -> Self {
         match &app.board {
-            BoardShown::State(state) => {
+            BoardShown::State { state, unanswered } => {
                 let strips = strips(state);
                 if strips.is_empty() {
                     Self::Message("No channel is assigned on the board.".to_owned())
                 } else {
                     Self::State {
                         strips,
-                        refreshing: state.refreshing,
+                        refreshing: state.refreshing || *unanswered,
                     }
                 }
             }
@@ -435,6 +435,9 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{MIN_BODY, Mode, keys_text, render};
+    use crate::daemon::CLIENT_TIMEOUT;
+    use crate::tui::REFRESH_EVERY;
+    use crate::tui::app::FAILURE_GRACE;
     use crate::tui::app::Focus;
     use crate::tui::app::{App, BoardIssue};
     use ratatui::Terminal;
@@ -643,23 +646,38 @@ mod tests {
         let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
         let start = Instant::now();
         app.set_board(Ok(board_state(true)), start);
-        let busy = || Err(BoardIssue::Other("socket timed out".to_owned()));
-        // Polls slowed down by the service: time counts, not polls.
-        app.set_board(busy(), start + Duration::from_secs(4));
+        // When real polls that time out end: time counts, not polls.
+        let poll = REFRESH_EVERY + CLIENT_TIMEOUT;
+        app.set_board(Err(BoardIssue::Timeout), start + poll);
         let screen_now = screen(&app);
         assert!(screen_now.contains("Console (refreshing…)"), "{screen_now}");
         assert!(screen_now.contains("F5"), "{screen_now}");
-        app.set_board(busy(), start + Duration::from_secs(5));
+        app.set_board(Err(BoardIssue::Timeout), start + FAILURE_GRACE);
         let screen_now = screen(&app);
         assert!(
-            screen_now.contains("Board service: socket timed out"),
+            screen_now.contains("Board service: no answer in time"),
             "{screen_now}"
         );
         // A later answer shows the state again, as current.
-        app.set_board(Ok(board_state(true)), start + Duration::from_secs(6));
+        app.set_board(Ok(board_state(true)), start + FAILURE_GRACE + poll);
         let screen_now = screen(&app);
         assert!(!screen_now.contains("refreshing"), "{screen_now}");
         assert!(screen_now.contains("F5"), "{screen_now}");
+    }
+
+    #[test]
+    fn an_error_other_than_a_timeout_is_said_at_once() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        let at = &mut Instant::now();
+        answer(&mut app, Ok(board_state(true)), at);
+        answer(
+            &mut app,
+            Err(BoardIssue::Other("invalid answer".to_owned())),
+            at,
+        );
+        let screen = screen(&app);
+        assert!(screen.contains("Board service: invalid answer"), "{screen}");
+        assert!(!screen.contains("F5"), "{screen}");
     }
 
     #[test]
@@ -668,7 +686,7 @@ mod tests {
         let at = &mut Instant::now();
         answer(&mut app, Ok(board_state(true)), at);
         let reason = "older than this rcp2ctl".to_owned();
-        answer(&mut app, Err(BoardIssue::Version(reason)), at);
+        answer(&mut app, Err(BoardIssue::Other(reason)), at);
         let screen = screen(&app);
         assert!(
             screen.contains("Board service: older than this rcp2ctl"),

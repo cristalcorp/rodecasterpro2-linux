@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use rcp2_audio::{Channel, Graph};
 
-use crate::daemon::StateDto;
+use crate::daemon::{CLIENT_TIMEOUT, StateDto};
 use crate::{BOARD_BEING_READ, BOARD_NOT_CONNECTED};
 
 /// Which panel receives the arrow keys.
@@ -56,19 +56,23 @@ pub(crate) struct App {
     last_answer: Option<Instant>,
 }
 
-/// How long a failed poll still shows the last state: a busy service is
-/// not worth a flicker, a lasting failure is worth saying. Longer than one
-/// poll (1 s apart) that times out (2 s).
-const FAILURE_GRACE: Duration = Duration::from_secs(5);
+/// How long a poll without an answer in time still shows the last state: a
+/// busy service is not worth a flicker, a lasting failure is worth saying.
+/// A poll that times out ends `REFRESH_EVERY + CLIENT_TIMEOUT` after the
+/// last answer; one more timeout is the margin.
+pub(crate) const FAILURE_GRACE: Duration = super::REFRESH_EVERY
+    .saturating_add(CLIENT_TIMEOUT)
+    .saturating_add(CLIENT_TIMEOUT);
 
 /// Why the board service could not be asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BoardIssue {
     /// No board service answers.
     NotRunning,
-    /// The service speaks another protocol version, with what to do.
-    Version(String),
-    /// Anything else, with the reason to show.
+    /// The service did not answer in time (busy, or stuck).
+    Timeout,
+    /// Anything else (another protocol version included), with the reason
+    /// to show.
     Other(String),
 }
 
@@ -78,9 +82,12 @@ pub(crate) type BoardView = Result<StateDto, BoardIssue>;
 /// What the Console panel shows, decided when an answer arrives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BoardShown {
-    /// The board's state; marked refreshing when it may no longer be
-    /// current (the board is read again, or the last poll failed).
-    State(StateDto),
+    /// The board's state as the service sent it; `unanswered` when the
+    /// service has not answered the latest polls in time.
+    State {
+        state: StateDto,
+        unanswered: bool,
+    },
     Message(String),
 }
 
@@ -98,8 +105,8 @@ impl App {
         }
     }
 
-    /// Records the board service's answer at `now`. A failed poll keeps the
-    /// last state for a moment, marked refreshing.
+    /// Records the board service's answer at `now`. A poll without an
+    /// answer in time keeps the last state for a moment, marked refreshing.
     pub(crate) fn set_board(&mut self, view: BoardView, now: Instant) {
         self.board = match view {
             Ok(state) => {
@@ -109,22 +116,25 @@ impl App {
                 } else if !state.state_known {
                     BoardShown::Message(BOARD_BEING_READ.to_owned())
                 } else {
-                    BoardShown::State(state)
+                    BoardShown::State {
+                        state,
+                        unanswered: false,
+                    }
                 }
             }
-            Err(BoardIssue::Other(reason)) => {
+            Err(BoardIssue::Timeout) => {
                 let recent = self
                     .last_answer
                     .is_some_and(|last| now.saturating_duration_since(last) < FAILURE_GRACE);
                 match &mut self.board {
-                    BoardShown::State(state) if recent => {
-                        state.refreshing = true;
+                    BoardShown::State { unanswered, .. } if recent => {
+                        *unanswered = true;
                         return;
                     }
-                    _ => BoardShown::Message(format!("Board service: {reason}")),
+                    _ => BoardShown::Message("Board service: no answer in time".to_owned()),
                 }
             }
-            Err(BoardIssue::Version(reason)) => {
+            Err(BoardIssue::Other(reason)) => {
                 BoardShown::Message(format!("Board service: {reason}"))
             }
             Err(BoardIssue::NotRunning) => BoardShown::Message(

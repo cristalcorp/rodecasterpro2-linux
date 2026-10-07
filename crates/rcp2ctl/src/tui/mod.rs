@@ -18,7 +18,7 @@ use crate::settings::{self, Settings};
 use crate::{CliError, Switch, outputs, persist, prepare, route, set_default};
 
 /// How often the graph is re-read when nothing happens.
-const REFRESH_EVERY: Duration = Duration::from_secs(1);
+pub(crate) const REFRESH_EVERY: Duration = Duration::from_secs(1);
 /// How long to wait for a key before handling background refreshes.
 const INPUT_POLL: Duration = Duration::from_millis(100);
 
@@ -31,13 +31,22 @@ fn board_view() -> BoardView {
     // Worded to follow "Board service: ".
     crate::daemon::query_state().map_err(|err| match err {
         DaemonError::NotRunning => BoardIssue::NotRunning,
-        // Kept short: the console gives a message one line.
-        DaemonError::ServiceOlder => BoardIssue::Version(
-            "older than this rcp2ctl, `hid setup` restarts it on this one".to_owned(),
+        // The version messages are kept short: the console gives a message
+        // one line.
+        DaemonError::ServiceOlder => BoardIssue::Other(
+            "older: restart it with this rcp2ctl (`rcp2ctl hid setup`)".to_owned(),
         ),
-        DaemonError::ServiceNewer => BoardIssue::Version(
-            "newer than this rcp2ctl, run the one it was installed with".to_owned(),
-        ),
+        DaemonError::ServiceNewer => {
+            BoardIssue::Other("newer: run the rcp2ctl it was installed with".to_owned())
+        }
+        DaemonError::Io { source, .. }
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            BoardIssue::Timeout
+        }
         DaemonError::BadAnswer(reason) => BoardIssue::Other(format!("invalid answer: {reason}")),
         err => BoardIssue::Other(err.to_string()),
     })

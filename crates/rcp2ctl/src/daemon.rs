@@ -28,7 +28,7 @@ const RECONNECT_EVERY: Duration = Duration::from_secs(2);
 /// Largest request accepted from a client.
 const MAX_REQUEST: u64 = 256;
 /// How long a client may take to send its request.
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Version of the socket protocol.
 /// 2: channels carry their source code, fader levels may be unreadable.
 /// 3: the previous state is kept, marked refreshing, while a new dump is read.
