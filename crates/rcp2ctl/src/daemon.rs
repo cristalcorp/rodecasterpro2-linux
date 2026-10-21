@@ -258,7 +258,11 @@ pub(crate) fn run(log: &mut impl Write) -> Result<(), DaemonError> {
             Ok((path, board))
         }) {
             Ok((path, board)) => {
-                let _ = writeln!(log, "board found at {}: opening a session", path.display());
+                let _ = writeln!(
+                    log,
+                    "board found at {}: reading it (not followed until asked)",
+                    path.display()
+                );
                 let reason = session(board, &shared, log);
                 let _ = writeln!(log, "session ended: {reason}");
                 session_ended(&shared);
