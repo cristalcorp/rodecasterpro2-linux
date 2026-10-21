@@ -1,7 +1,7 @@
 //! Interactive terminal interface: `rcp2ctl` without a subcommand.
 
 mod app;
-mod board;
+pub(crate) mod board;
 mod view;
 
 use std::path::Path;
@@ -17,7 +17,7 @@ use self::app::{Action, App, Level};
 use self::board::{BoardIssue, BoardView, Patience};
 use self::view::Mode;
 use crate::settings::{self, Settings};
-use crate::{CliError, Switch, outputs, persist, prepare, route, set_default};
+use crate::{CliError, Switch, follow_board, outputs, persist, prepare, route, set_default};
 
 /// How often the graph is re-read when nothing happens.
 pub(crate) const REFRESH_EVERY: Duration = Duration::from_secs(1);
@@ -32,7 +32,7 @@ type Snapshot = (Instant, Result<Graph, PwError>);
 
 /// Asks the board service for the board state.
 fn board_view() -> BoardView {
-    crate::daemon::query_state().map_err(|err| BoardIssue::from(&err))
+    crate::daemon::query(crate::daemon::Request::State).map_err(|err| BoardIssue::from(&err))
 }
 
 /// Asks the board service for the board state every [`BOARD_EVERY`], on its
@@ -201,6 +201,7 @@ fn perform(action: &Action, app: &mut App, settings: &mut Settings, path: &Path)
         }
         Action::EnablePersist => persist(&app.graph, settings, Switch::On, &mut text),
         Action::RestoreOriginal => persist(&app.graph, settings, Switch::Off, &mut text),
+        Action::FollowBoard => follow_board(&mut text),
         Action::Refresh | Action::None | Action::Quit => Ok(()),
     };
     app.message = match result {

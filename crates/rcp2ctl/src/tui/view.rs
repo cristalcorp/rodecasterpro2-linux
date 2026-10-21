@@ -231,8 +231,12 @@ fn cut_lines(mut lines: Vec<String>, rows: usize, width: usize) -> Vec<String> {
 }
 
 fn render_console(frame: &mut Frame<'_>, board: &BoardShown, lines: Vec<String>, area: Rect) {
-    let (strips, refreshing) = match board {
-        BoardShown::Strips { strips, refreshing } => (strips, *refreshing),
+    let (strips, refreshing, followed) = match board {
+        BoardShown::Strips {
+            strips,
+            refreshing,
+            followed,
+        } => (strips, *refreshing, *followed),
         BoardShown::Message(_) => {
             let text: Vec<Line<'_>> = lines.into_iter().map(Line::from).collect();
             frame.render_widget(
@@ -244,10 +248,11 @@ fn render_console(frame: &mut Frame<'_>, board: &BoardShown, lines: Vec<String>,
             return;
         }
     };
-    let title = if refreshing {
-        " Console (refreshing…) "
-    } else {
-        " Console "
+    let title = match (refreshing, followed) {
+        (true, true) => " Console (refreshing…) · power it off before the PC ",
+        (true, false) => " Console (refreshing…) ",
+        (false, true) => " Console · power it off before the PC ",
+        (false, false) => " Console ",
     };
     let rows = strips.iter().map(|strip| {
         let style = match strip.muted {
@@ -374,13 +379,14 @@ const HELP: &[(&str, &str)] = &[
     ("Enter / d", "make the selected output the default"),
     ("o", "named outputs on / off"),
     ("p", "keep outputs after reboot (install the config file)"),
+    ("c", "show the board (then power it off before the PC)"),
     ("r", "restore the original PipeWire configuration"),
     ("F5 / Ctrl+L", "refresh now (also automatic every second)"),
     ("q / Esc", "quit"),
 ];
 
 fn render_help(frame: &mut Frame<'_>) {
-    let area = centered(frame.area(), 70, 14);
+    let area = centered(frame.area(), 70, 15);
     let mut lines: Vec<Line<'_>> = HELP
         .iter()
         .map(|(key, what)| {
@@ -552,6 +558,20 @@ mod tests {
         assert!(screen.contains("F7     ?"), "{screen}");
         assert!(screen.contains("source 9"), "{screen}");
         assert!(screen.contains("············ 0%"), "{screen}");
+    }
+
+    #[test]
+    fn a4_a_followed_board_says_to_power_it_off_first() {
+        let mut app = App::new(Graph::from_pw_dump(DUMP).unwrap());
+        app.console.record(Ok(board_state(true)));
+        let screen = screen(&app);
+        assert!(
+            screen.contains("Console · power it off before the PC"),
+            "{screen}"
+        );
+        // The help tells the key.
+        app.show_help = true;
+        assert!(screen_of_height(&app, 24).contains("show the board"));
     }
 
     #[test]

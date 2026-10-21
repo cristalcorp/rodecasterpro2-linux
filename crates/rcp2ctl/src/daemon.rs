@@ -1,9 +1,12 @@
 //! `rcp2ctl daemon`: owns the board's control session and serves its state.
 //!
-//! Once subscribed, the board freezes its faders if nobody reads its HID
-//! interface (I-007), so this service keeps reading for as long as it runs.
-//! It also keeps an up-to-date copy of the board's state tree, which other
-//! commands read through a private Unix socket. Read-only: it never writes a
+//! Once subscribed (the handshake), the board queues a notification for every
+//! change and waits for them to be read before it can power off (I-016), so
+//! this service reads its HID interface for as long as it runs, and only
+//! subscribes when asked (D-041, table A of `05-Etats-et-flux`): a board
+//! nobody asked to follow still powers off after the computer. Once
+//! subscribed, it keeps an up-to-date copy of the board's state tree, which
+//! other commands read through a private Unix socket. Read-only: it never writes a
 //! setting to the board. Alongside, it recreates the named outputs when the
 //! board's sound card comes back (see [`crate::keeper`]).
 
@@ -37,7 +40,9 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 ///    board.
 /// 6: each channel carries its live level; `faders` (whose `faderLevel` is
 ///    not the fader's position, I-013) becomes `fader_count`.
-pub(crate) const PROTOCOL_VERSION: u32 = 6;
+/// 7: `subscribed`, and the `follow` request: the service subscribes to the
+///    board only when asked (D-041).
+pub(crate) const PROTOCOL_VERSION: u32 = 7;
 /// How long the previous state is still served while a new dump is awaited:
 /// a dump takes a moment, one that never comes must not leave old values.
 const STALE_FOR: Duration = Duration::from_secs(15);
@@ -142,6 +147,9 @@ pub(crate) struct StateDto {
     /// The service has not finished its first look at the board (searching
     /// it, or reading its first dump); bounded by [`STALE_FOR`].
     pub(crate) starting: bool,
+    /// The board is subscribed, or about to be (asked to follow it): it must
+    /// then be powered off before the computer (I-016).
+    pub(crate) subscribed: bool,
     pub(crate) firmware: Option<String>,
     pub(crate) channels: Vec<ChannelDto>,
     /// Number of physical faders: strip `n` sits on fader `n + 1`.
@@ -154,6 +162,8 @@ impl StateDto {
     fn new(shared: &Shared, now: Instant) -> Self {
         let Shared {
             connected,
+            subscribed,
+            follow_wanted,
             ref tree,
             refreshing_since,
             starting_since,
@@ -170,6 +180,7 @@ impl StateDto {
             state_known: tree.is_some(),
             refreshing: tree.is_some() && refreshing_since.is_some(),
             starting: starting_since.is_some_and(recent),
+            subscribed: subscribed || follow_wanted,
             firmware: state.firmware,
             channels: state
                 .channels
@@ -192,6 +203,10 @@ impl StateDto {
 #[derive(Default)]
 struct Shared {
     connected: bool,
+    /// The handshake was sent in this session (A2, A3).
+    subscribed: bool,
+    /// Asked to follow the board (A3): subscribed at the session's next look.
+    follow_wanted: bool,
     /// The last complete state, kept while a new dump is read.
     tree: Option<Node>,
     /// Since when the tree is not the board's: a new dump was asked for, or
@@ -264,10 +279,49 @@ fn board_absent(shared: &SharedState) {
     lock(shared).starting_since = None;
 }
 
-/// S11: the session is over, and starting with it; a blank state until the
-/// board is found again.
+/// S11, A5: the session is over, and starting with it; a blank state until
+/// the board is found again. A subscription, or a wish to follow, is not kept
+/// for the next session (A7).
 fn session_ended(shared: &SharedState) {
     *lock(shared) = Shared::default();
+}
+
+/// A1: the board is found and read, not subscribed (a session starts from
+/// the blank state [`session_ended`] leaves): nothing to wait for, the first
+/// look is over.
+fn session_started(shared: &SharedState) {
+    let mut state = lock(shared);
+    state.connected = true;
+    state.starting_since = None;
+}
+
+/// A3, A7: a client asks to follow the board. Refused (`false`) without a
+/// board; otherwise its state is read from then on (`starting`), and the
+/// session subscribes at its next look.
+fn follow(shared: &SharedState, now: Instant) -> bool {
+    let mut state = lock(shared);
+    if !state.connected {
+        return false;
+    }
+    if !state.subscribed && !state.follow_wanted {
+        state.follow_wanted = true;
+        state.starting_since = Some(now);
+    }
+    true
+}
+
+/// Whether the session must subscribe now: asked to (A3), or the board sends
+/// while nobody subscribed in this session, so an earlier one did (A2).
+/// Recorded as done: the caller sends the handshake.
+fn take_subscription(shared: &SharedState, report_seen: bool, now: Instant) -> bool {
+    let mut state = lock(shared);
+    if state.subscribed || !(state.follow_wanted || report_seen) {
+        return false;
+    }
+    state.subscribed = true;
+    state.follow_wanted = false;
+    state.starting_since.get_or_insert(now);
+    true
 }
 
 /// Takes the instance lock, then binds the socket in a private directory,
@@ -319,26 +373,40 @@ fn bind(path: &Path) -> Result<(fs::File, UnixListener), DaemonError> {
     Ok((lock, listener))
 }
 
-/// One session with the board, until it is unplugged or a read fails.
+/// One session with the board, until it is unplugged or a read fails: read
+/// all along, subscribed only when table A says so.
 fn session(mut board: rcp2_hid::Board, shared: &SharedState, log: &mut impl Write) -> String {
     let reports = match board.reports(Instant::now()) {
         Ok(reports) => reports,
         Err(err) => return err.to_string(),
     };
+    session_started(shared);
     let mut sync = Tracker::default();
-    sync.start_request(shared, Instant::now());
-    if let Err(err) = board.handshake() {
-        return err.to_string();
-    }
-    lock(shared).connected = true;
     loop {
-        match reports.recv_timeout(TICK) {
-            Ok(Ok(report)) => sync.handle(&report.bytes, shared, Instant::now()),
+        let report = match reports.recv_timeout(TICK) {
+            Ok(Ok(report)) => Some(report),
             Ok(Err(err)) => return format!("read error: {err}"),
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return "reader stopped".to_owned(),
-        }
+        };
         let now = Instant::now();
+        if take_subscription(shared, report.is_some(), now) {
+            let why = if report.is_some() {
+                "the board sends without a handshake (subscribed earlier)"
+            } else {
+                "asked to follow the board"
+            };
+            let _ = writeln!(log, "{why}: subscribing, power the board off before the PC");
+            // The report that told is not read: the dump replaces it.
+            sync.start_request(shared, now);
+            if let Err(err) = board.handshake() {
+                return err.to_string();
+            }
+            continue;
+        }
+        if let Some(report) = report {
+            sync.handle(&report.bytes, shared, now);
+        }
         if sync.due(now) {
             let _ = writeln!(
                 log,
@@ -549,8 +617,14 @@ fn answer(stream: UnixStream, shared: &SharedState) -> io::Result<()> {
         return Ok(());
     }
     let mut stream = stream;
-    if request.trim() != "state" {
-        return writeln!(stream, "{{\"error\":\"unknown request\"}}");
+    match request.trim() {
+        // A6: never subscribes.
+        "state" => {}
+        // A3, A7: the answer tells whether it was taken (`connected`).
+        "follow" => {
+            follow(shared, Instant::now());
+        }
+        _ => return writeln!(stream, "{{\"error\":\"unknown request\"}}"),
     }
     // Built under the lock, so every field is of the same moment: it reads
     // a few nodes, cheaper than copying the tree out. The lock is released
@@ -569,7 +643,8 @@ fn check_version(version: u32) -> Result<(), DaemonError> {
     }
 }
 
-/// Asks the running service for the board state.
+/// Asks the running service for the board state (`state`), or to follow the
+/// board first (`follow`: the answer says `connected = false` if refused).
 ///
 /// # Errors
 ///
@@ -578,20 +653,38 @@ fn check_version(version: u32) -> Result<(), DaemonError> {
 /// now (within [`QUERY_TIMEOUT`]), [`DaemonError::BadAnswer`] if the answer
 /// cannot be read, and [`DaemonError::ServiceOlder`] or
 /// [`DaemonError::ServiceNewer`] if it speaks another protocol version.
-pub(crate) fn query_state() -> Result<StateDto, DaemonError> {
+pub(crate) fn query(request: Request) -> Result<StateDto, DaemonError> {
     let path = socket_path()?;
     let deadline = Instant::now() + QUERY_TIMEOUT;
     let mut stream = connect(&path)?;
-    let line = exchange(&mut stream, deadline).map_err(|err| answer_err(&path, err))?;
+    let line = exchange(&mut stream, request, deadline).map_err(|err| answer_err(&path, err))?;
     parse_answer(&line)
 }
 
+/// What a client asks the service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Request {
+    /// The board state; never subscribes (A6).
+    State,
+    /// Follow the board (subscribe), then the state (A3).
+    Follow,
+}
+
+impl Request {
+    const fn line(self) -> &'static str {
+        match self {
+            Self::State => "state",
+            Self::Follow => "follow",
+        }
+    }
+}
+
 /// Sends the request and reads the answer line, all by `deadline`.
-fn exchange(stream: &mut UnixStream, deadline: Instant) -> io::Result<String> {
+fn exchange(stream: &mut UnixStream, request: Request, deadline: Instant) -> io::Result<String> {
     stream.set_write_timeout(Some(time_left(deadline)?))?;
     // A busy service answers and hangs up without reading: the request may
     // then fail to go out, but its answer is there to read.
-    if let Err(err) = writeln!(stream, "state")
+    if let Err(err) = writeln!(stream, "{}", request.line())
         && !matches!(
             err.kind(),
             io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
@@ -715,9 +808,9 @@ fn parse_answer(line: &str) -> Result<StateDto, DaemonError> {
 mod tests {
     use super::{
         BUSY_ANSWER, CHUNK_SILENCE, DaemonError, MAX_PENDING, PROTOCOL_VERSION, QUERY_TIMEOUT,
-        RESYNC_EVERY, STALE_FOR, Shared, SharedState, StateDto, Tracker, answer_err, apply, bind,
-        board_absent, check_version, connect, exchange, lock, parse_answer, read_answer,
-        session_ended, turn_away,
+        RESYNC_EVERY, Request, STALE_FOR, Shared, SharedState, StateDto, Tracker, answer,
+        answer_err, apply, bind, board_absent, check_version, connect, exchange, follow, lock,
+        parse_answer, read_answer, session_ended, session_started, take_subscription, turn_away,
     };
     use rcp2_proto::{Change, Node, Var};
     use std::io::Write as _;
@@ -827,6 +920,8 @@ mod tests {
         let asked = Instant::now();
         let shared = Shared {
             connected: true,
+            subscribed: true,
+            follow_wanted: false,
             tree: Some(Node::default()),
             refreshing_since: Some(asked),
             starting_since: None,
@@ -914,9 +1009,13 @@ mod tests {
         let (mut ours, theirs) = UnixStream::pair().unwrap();
         // The service answers busy and hangs up before the request is sent.
         turn_away(theirs);
-        let answer = exchange(&mut ours, Instant::now() + Duration::from_secs(1))
-            .map_err(|err| answer_err(Path::new("test.sock"), err))
-            .and_then(|line| parse_answer(&line));
+        let answer = exchange(
+            &mut ours,
+            Request::State,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .map_err(|err| answer_err(Path::new("test.sock"), err))
+        .and_then(|line| parse_answer(&line));
         assert!(matches!(answer, Err(DaemonError::Busy)), "{answer:?}");
     }
 
@@ -1305,6 +1404,106 @@ mod tests {
         // A session ended: the service starts again from a blank state.
         let ended = StateDto::new(&Shared::default(), t0);
         assert!(!ended.connected && !ended.starting && !ended.state_known);
+    }
+
+    // Table A of `05-Etats-et-flux`: when the service subscribes.
+
+    fn served(shared: &SharedState, now: Instant) -> StateDto {
+        StateDto::new(&lock(shared), now)
+    }
+
+    /// A service that has just found the board.
+    fn found(t0: Instant) -> SharedState {
+        let shared = SharedState::new(std::sync::Mutex::new(Shared {
+            starting_since: Some(t0),
+            ..Shared::default()
+        }));
+        session_started(&shared);
+        shared
+    }
+
+    /// Sends `request` to [`answer`] as a client would; the state served.
+    fn ask(shared: &SharedState, request: &str) -> StateDto {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        writeln!(ours, "{request}").unwrap();
+        answer(theirs, shared).unwrap();
+        let line = read_answer(&mut ours, Instant::now() + Duration::from_secs(1)).unwrap();
+        parse_answer(&line).unwrap()
+    }
+
+    #[test]
+    fn a1_a_found_board_is_read_not_subscribed() {
+        let t0 = Instant::now();
+        let shared = found(t0);
+        let state = served(&shared, t0);
+        assert!(state.connected && !state.subscribed);
+        // Nothing to wait for: the first look is over.
+        assert!(!state.starting && !state.state_known);
+        // Quiet, not asked: never subscribed.
+        assert!(!take_subscription(&shared, false, t0 + secs(60.0)));
+    }
+
+    #[test]
+    fn a2_a_board_that_sends_unasked_was_subscribed_earlier() {
+        let t0 = Instant::now();
+        let shared = found(t0);
+        assert!(take_subscription(&shared, true, t0 + secs(1.0)));
+        let state = served(&shared, t0 + secs(1.0));
+        assert!(state.subscribed && state.starting);
+    }
+
+    #[test]
+    fn a3_asked_to_follow_it_subscribes_once() {
+        let t0 = Instant::now();
+        let shared = found(t0);
+        // Said at once: the client does not guess.
+        let state = ask(&shared, "follow");
+        assert!(state.connected && state.subscribed && state.starting);
+        assert!(take_subscription(&shared, false, t0 + secs(1.0)));
+        // A4: done once; reports or a second request do not subscribe again.
+        assert!(!take_subscription(&shared, true, t0 + secs(2.0)));
+        assert!(ask(&shared, "follow").subscribed);
+        assert!(!take_subscription(&shared, false, t0 + secs(3.0)));
+    }
+
+    #[test]
+    fn a5_an_unplugged_board_is_no_longer_subscribed() {
+        let t0 = Instant::now();
+        let shared = found(t0);
+        assert!(follow(&shared, t0));
+        assert!(take_subscription(&shared, false, t0));
+        session_ended(&shared);
+        assert!(!served(&shared, t0).subscribed);
+        // Plugged in again: read, not subscribed.
+        session_started(&shared);
+        assert!(!served(&shared, t0).subscribed);
+        assert!(!take_subscription(&shared, false, t0 + secs(1.0)));
+        // A wish to follow not yet acted on goes with the session too.
+        assert!(follow(&shared, t0 + secs(2.0)));
+        session_ended(&shared);
+        session_started(&shared);
+        assert!(!take_subscription(&shared, false, t0 + secs(3.0)));
+    }
+
+    #[test]
+    fn a6_asking_for_the_state_never_subscribes() {
+        let t0 = Instant::now();
+        let shared = found(t0);
+        let state = ask(&shared, "state");
+        assert!(state.connected && !state.subscribed);
+        assert!(!take_subscription(&shared, false, t0 + secs(1.0)));
+    }
+
+    #[test]
+    fn a7_following_an_absent_board_is_refused_and_forgotten() {
+        let t0 = Instant::now();
+        let shared = SharedState::default();
+        let state = ask(&shared, "follow");
+        assert!(!state.connected && !state.subscribed);
+        // Found later: not subscribed for that earlier request.
+        session_started(&shared);
+        assert!(!take_subscription(&shared, false, t0 + secs(1.0)));
+        assert!(!served(&shared, t0).subscribed);
     }
 
     #[test]
