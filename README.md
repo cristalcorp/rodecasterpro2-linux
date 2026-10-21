@@ -154,16 +154,24 @@ One effect is known and harmless, but you need to know about it:
 > On Windows and macOS the system always reads them; on Linux it stops when the
 > program exits.
 >
-> The **board service** installed by `rcp2ctl hid setup` reads them for as long
-> as it runs, so this does not happen in normal use. It does happen after a
+> The **board service** installed by `rcp2ctl hid setup` reads the board for as
+> long as it runs, so this does not happen in normal use. It does happen after a
 > one-off `hid capture` without the service, and after the service is stopped
 > (for example by `rcp2ctl uninstall`): replug the board, or start the service
 > again (`systemctl --user restart rodecasterpro2-linux`), which also gives the
 > faders back. **Do not run a capture during a recording or a live show.**
 >
-> **Turn the board off before the computer.** If the computer shuts down first,
-> the service stops with it, the board freezes, and it may then hang when you
-> turn it off: unplug it in that case.
+> **Once the board is followed, turn it off before the computer.** A followed
+> board waits for its notifications to be read before it can power off; once
+> the computer is off, nobody reads them and its power button no longer
+> responds: unplug its USB cable, and it powers off at once. No command is
+> known to stop following a board: it stays followed until it is powered off.
+>
+> So the service **reads the board without following it** until you ask: `c`
+> in the TUI, or `rcp2ctl board`. A board you never asked to show powers off
+> normally after the computer. The TUI says so while a board is followed. If
+> the board was followed in an earlier session (the computer restarted while
+> it stayed on), the service notices and follows it again.
 
 ## 6. First steps
 
@@ -186,11 +194,13 @@ The screen has a header (board, how the outputs are kept, default output), an
   service, see below).
 - "absent" means the named output does not exist right now.
 
-When the board service runs (`rcp2ctl hid setup`), a **Console** panel at the
-bottom shows the board's channel strips: fader, source, whether the output is
-muted and its level as a percentage, both updated live as you press a mute
-button or move a fader. Without the service, the panel says how to start it;
-everything else works the same.
+When the board service runs (`rcp2ctl hid setup`), press `c` and a **Console**
+panel at the bottom shows the board's channel strips: fader, source, whether
+the output is muted and its level as a percentage, both updated live as you
+press a mute button or move a fader. From then on the board is followed until
+it is powered off: **turn it off before the computer** (see
+[Risks](#5-risks)); the panel's title reminds you. Without the service, the
+panel says how to start it; everything else works the same.
 
 | Key | Action |
 |---|---|
@@ -201,6 +211,7 @@ everything else works the same.
 | `o` | Named outputs on / off |
 | `p` | Keep the outputs after a reboot (installs a PipeWire config file) |
 | `r` | Restore the original PipeWire configuration |
+| `c` | Show the board's state (the board is then followed until it is powered off) |
 | `F5` or `Ctrl+L` | Refresh now (the view also refreshes every second) |
 | `?` | Help |
 | `q`, `Esc` or `Ctrl+C` | Quit |
@@ -270,8 +281,10 @@ installing anything. Useful for packagers.
 
 Shows the board's own state — firmware version, each channel strip (source,
 muted or not, level as a percentage) and how many changes were applied since
-the last full read — as kept up to date by the board service. Fails with a
-clear message if the service is not running.
+the last full read — as kept up to date by the board service. The service
+then follows the board until it is powered off: turn it off before the
+computer (see [Risks](#5-risks)). Fails with a clear message if the service is
+not running.
 
 ### `rcp2ctl daemon`
 
@@ -344,9 +357,11 @@ Distribution packages should ship `packaging/udev/70-rodecaster-pro-2.rules` in
 ### 10.2 The board service
 
 The service (`rcp2ctl daemon`, run by systemd as your user, never as root)
-opens the session with the board, keeps reading it so that the faders keep
-working, and keeps a copy of the board's state up to date from its
-notifications. When the board is unplugged it waits and reconnects on its own,
+keeps reading the board's control interface. It opens a session with the
+board (follows it) only when asked, with `c` in the TUI or `rcp2ctl board`,
+or when the board turns out to be followed already; from then on it keeps a
+copy of the board's state up to date from its notifications, until the board
+is unplugged or powered off. When the board is unplugged it waits and reconnects on its own,
 and recreates the named outputs once the board's sound card is back (see
 [How the named outputs are kept](#9-how-the-named-outputs-are-kept)).
 
@@ -478,6 +493,7 @@ opens the TUI; in scripts, use the commands from the reference.
 | Terminal interface | Done (audio side) |
 | Reading the board's state | Done: exact decoder, board service, `rcp2ctl board` |
 | Fix for the fader freeze | Done while the board service runs |
+| Board that cannot power off after the computer | Avoided unless the board is followed (`c`, `rcp2ctl board`); no way known to stop following it |
 | Board state in the TUI | Done: Console panel, fader of each output |
 | Live fader levels in the TUI | Done: each channel's level, updated as the fader moves |
 | Writing board settings (mutes, gain, processing) | Later, one setting type at a time, each tested on hardware first |

@@ -8,7 +8,7 @@ use rcp2_proto::InputSource;
 
 use crate::daemon::{DaemonError, StateDto};
 use crate::service::RESTART_AFTER;
-use crate::{BOARD_BEING_READ, BOARD_NOT_CONNECTED};
+use crate::{BOARD_BEING_READ, BOARD_NOT_CONNECTED, BOARD_NOT_FOLLOWED};
 
 /// How long a restarted service takes to listen again after systemd starts
 /// it (its first look at the board is then told by `starting`).
@@ -103,11 +103,13 @@ pub(crate) struct Strip {
 /// What the Console panel shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BoardShown {
-    /// Strips worth showing (empty ones hidden, unreadable ones kept), and
-    /// whether they may no longer be current.
+    /// Strips worth showing (empty ones hidden, unreadable ones kept),
+    /// whether they may no longer be current, and whether the board is
+    /// followed (it must then be powered off before the computer).
     Strips {
         strips: Vec<Strip>,
         refreshing: bool,
+        followed: bool,
     },
     Message(String),
 }
@@ -239,6 +241,10 @@ fn from_state(state: &StateDto, unanswered: bool) -> BoardShown {
     if !state.connected {
         return BoardShown::Message(BOARD_NOT_CONNECTED.to_owned());
     }
+    // A1: nothing to show until asked.
+    if !state.subscribed {
+        return BoardShown::Message(BOARD_NOT_FOLLOWED.to_owned());
+    }
     if !state.state_known {
         return BoardShown::Message(BOARD_BEING_READ.to_owned());
     }
@@ -262,6 +268,7 @@ fn from_state(state: &StateDto, unanswered: bool) -> BoardShown {
     BoardShown::Strips {
         strips,
         refreshing: state.refreshing || unanswered,
+        followed: state.subscribed,
     }
 }
 
@@ -290,6 +297,7 @@ pub(crate) mod tests {
             state_known: known,
             refreshing: false,
             starting: false,
+            subscribed: true,
             firmware: Some("1.7.6".to_owned()),
             channels: if known {
                 vec![
@@ -608,6 +616,26 @@ pub(crate) mod tests {
         bare.channels.clear();
         console.record(Ok(bare));
         assert_eq!(text(&console), super::NO_CHANNEL);
+    }
+
+    #[test]
+    fn a1_a_board_not_followed_says_how_to_follow_it() {
+        let mut console = Console::new();
+        let mut state = board_state(false);
+        state.subscribed = false;
+        console.record(Ok(state));
+        assert_eq!(text(&console), crate::BOARD_NOT_FOLLOWED);
+        assert!(text(&console).contains("press c"));
+    }
+
+    #[test]
+    fn a4_followed_strips_say_so() {
+        let mut console = Console::new();
+        console.record(Ok(board_state(true)));
+        assert!(matches!(
+            console.shown(),
+            BoardShown::Strips { followed: true, .. }
+        ));
     }
 
     #[test]

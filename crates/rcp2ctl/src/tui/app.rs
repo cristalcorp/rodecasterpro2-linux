@@ -30,6 +30,8 @@ pub(crate) enum Action {
     EnablePersist,
     /// Put back the original PipeWire configuration.
     RestoreOriginal,
+    /// Ask the board service to follow the board (A3).
+    FollowBoard,
 }
 
 /// Severity of the message shown under the panels.
@@ -109,6 +111,7 @@ impl App {
             KeyCode::Char('r') => Action::RestoreOriginal,
             KeyCode::Char('o') => Action::ToggleOutputs,
             KeyCode::Char('p') => Action::EnablePersist,
+            KeyCode::Char('c') => Action::FollowBoard,
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
                 self.focus = match self.focus {
                     Focus::Apps => Focus::Outputs,
@@ -231,6 +234,16 @@ mod tests {
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
             Action::Refresh
+        );
+    }
+
+    #[test]
+    fn a3_c_follows_the_board_and_ctrl_c_still_quits() {
+        let mut app = app();
+        assert_eq!(press(&mut app, KeyCode::Char('c')), Action::FollowBoard);
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Quit
         );
     }
 

@@ -71,7 +71,8 @@ enum Command {
         channel: Channel,
     },
     /// Show the board's own state (channels, mutes, levels), read from the
-    /// board service.
+    /// board service. The service then follows the board until it is powered
+    /// off: power it off before the computer.
     Board,
     /// Run the board service in the foreground (normally started by systemd,
     /// see `rcp2ctl hid setup`). Keeps the control session read, so the board's
@@ -1088,6 +1089,13 @@ pub(crate) const BOARD_NOT_CONNECTED: &str =
     "Board service running, but the board is not connected.";
 /// Shown while the board service reads the board's state.
 pub(crate) const BOARD_BEING_READ: &str = "Board connected; its state is being read.";
+/// Shown while the board is read but not followed (A1).
+pub(crate) const BOARD_NOT_FOLLOWED: &str = "Board connected, not followed: press c to show its \
+     state (it must then be powered off before the computer).";
+/// Shown while the board is followed (A4): it waits for its notifications to
+/// be read before it can power off (I-016).
+pub(crate) const BOARD_FOLLOWED: &str =
+    "The board is followed: power it off before the computer, or it cannot power off.";
 
 /// Prints a board state: shared by `board` (from the service) and `hid decode`.
 fn print_board(
@@ -1110,11 +1118,11 @@ fn print_board(
 /// Asks the board service, again a few times while it says it is busy;
 /// asking again while it does not answer at all would only wait longer, and
 /// one that hung up is said as is (a restart takes longer than these tries).
-fn query_board() -> Result<daemon::StateDto, daemon::DaemonError> {
+fn query_board(request: daemon::Request) -> Result<daemon::StateDto, daemon::DaemonError> {
     const ATTEMPTS: u32 = 3;
     let mut attempt = 1;
     loop {
-        match daemon::query_state() {
+        match daemon::query(request) {
             Err(daemon::DaemonError::Busy) if attempt < ATTEMPTS => {
                 attempt += 1;
                 std::thread::sleep(Duration::from_secs(1));
@@ -1124,14 +1132,50 @@ fn query_board() -> Result<daemon::StateDto, daemon::DaemonError> {
     }
 }
 
+/// How long `board` waits for the state of a board it has just asked to
+/// follow: a dump takes a second or two.
+const FOLLOW_WAIT: Duration = Duration::from_secs(5);
+/// Pause between two looks at the state while waiting for it.
+const FOLLOW_POLL: Duration = Duration::from_millis(250);
+
 fn board(out: &mut impl Write) -> Result<(), CliError> {
-    let state = query_board()?;
+    // A3: asking for the board's state is asking to follow it.
+    let mut state = query_board(daemon::Request::Follow)?;
+    let deadline = std::time::Instant::now() + FOLLOW_WAIT;
+    while state.connected
+        && !state.state_known
+        && state.starting
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(FOLLOW_POLL);
+        state = query_board(daemon::Request::State)?;
+    }
+    print_board_state(&state, out)
+}
+
+/// Asks the service to follow the board (A3, A7), for the TUI's `c` key.
+fn follow_board(out: &mut impl Write) -> Result<(), CliError> {
+    let state = query_board(daemon::Request::Follow)?;
+    if state.connected {
+        writeln!(out, "{BOARD_FOLLOWED}")?;
+    } else {
+        writeln!(out, "{BOARD_NOT_CONNECTED} Nothing to follow.")?;
+    }
+    Ok(())
+}
+
+/// What `board` prints for an answer of the service.
+fn print_board_state(state: &daemon::StateDto, out: &mut impl Write) -> Result<(), CliError> {
+    // A7: a board absent is not followed.
     if !state.connected {
         writeln!(out, "{BOARD_NOT_CONNECTED}")?;
         return Ok(());
     }
     if !state.state_known {
         writeln!(out, "{BOARD_BEING_READ} Try again in a moment.")?;
+        if state.subscribed {
+            writeln!(out, "{BOARD_FOLLOWED}")?;
+        }
         return Ok(());
     }
     let channels: Vec<_> = state
@@ -1151,6 +1195,9 @@ fn board(out: &mut impl Write) -> Result<(), CliError> {
             "Changes applied since the last dump: {}",
             state.notifications
         )?;
+    }
+    if state.subscribed {
+        writeln!(out, "{BOARD_FOLLOWED}")?;
     }
     Ok(())
 }
@@ -1234,7 +1281,33 @@ fn join_ids(ids: &[u32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{level_label, level_percent, print_board};
+    use super::{level_label, level_percent, print_board, print_board_state};
+    use crate::tui::board::tests::board_state;
+
+    fn printed(state: &crate::daemon::StateDto) -> String {
+        let mut out = Vec::new();
+        print_board_state(state, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn a3_a7_board_says_whether_it_follows_the_board() {
+        // A4: followed, and said so.
+        let text = printed(&board_state(true));
+        assert!(text.contains("Mic 1"), "{text}");
+        assert!(text.contains(crate::BOARD_FOLLOWED), "{text}");
+        // Still being read: said too.
+        let text = printed(&board_state(false));
+        assert!(text.contains(crate::BOARD_BEING_READ), "{text}");
+        assert!(text.contains(crate::BOARD_FOLLOWED), "{text}");
+        // A7: absent, nothing followed.
+        let mut absent = board_state(false);
+        absent.connected = false;
+        absent.subscribed = false;
+        let text = printed(&absent);
+        assert!(text.contains(crate::BOARD_NOT_CONNECTED), "{text}");
+        assert!(!text.contains(crate::BOARD_FOLLOWED), "{text}");
+    }
 
     #[test]
     fn levels_are_shown_as_percentages() {
